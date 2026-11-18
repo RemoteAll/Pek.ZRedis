@@ -1,0 +1,9 @@
+# 文本文件统一 LF 入库与检出（避免 Zig 源码被 CRLF 化导致 zig fmt --check 失败）
+* text=auto eol=lf
+
+# 接续指令模板必须按字节原样存储：跨仓巡检做的是字节级比对，
+# 任何换行转换都会造成「同版本内容不同」的假阳性。
+tools/continuity/templates/** -text
+
+# 中文 PowerShell 脚本保留原样（BOM 与换行由脚本自身维护）
+*.ps1 -text

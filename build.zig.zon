@@ -1,0 +1,25 @@
+.{
+    .name = .pek_zredis,
+    .version = "0.1.0",
+    .fingerprint = 0x4c95051b01e3eaf6,
+    .minimum_zig_version = "0.17.0",
+
+    // zzig 是 Zig 侧公共基础库（对齐 Rust 侧 dhrust）：本库只用它的
+    // compat（当前 Io / 单调时钟 / 睡眠）、DateTime 与日志约定，不复制这些基础件。
+    .dependencies = .{
+        .zzig = .{
+            .path = "../zzig",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "docs",
+        "examples",
+        "tools",
+        "README.md",
+    },
+}

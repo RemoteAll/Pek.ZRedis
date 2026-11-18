@@ -1,0 +1,23 @@
+# Zig 构建产物与本地缓存
+.zig-cache/
+zig-out/
+.zig-cache-regression/
+
+# 回归 / 对拍工件（报告、临时输出）
+artifacts/
+
+# 本地数据库与 WAL（跑真库/端到端时会生成）
+*.db
+*.db-shm
+*.db-wal
+
+# IDE / 系统
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# 临时文件
+*.tmp
+*.log
