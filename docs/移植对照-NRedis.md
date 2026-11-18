@@ -108,15 +108,15 @@
 - **命令级自动选路**：启用拓扑后 `Redis.execute` / `executeBlocking` 按单键命令表（key 固定第 1 参数）自动选节点，
   自动处理 `MOVED`/`ASK`/失败重选；因此**各结构体（哈希/列表/集合/有序集合/队列/Stream/Tair）的单键命令自动生效**。
   多键：`MGET` / `DEL` 按节点**分组执行再按原顺序汇总**；`setAll` 在拓扑模式下转逐键 `SET`（EXPIRE 与键同节点）；
-  `RENAME`/`EVAL`/`BITOP` 等跨键命令仍走主连接池（与 C#/Rust 多键限制一致）。
+  跨键命令（`RENAME`/`SMOVE`/`BITOP`/`EVAL`/`SUNION` 等）按**第一个 key** 选路（key 下标特例：`BITOP`=2、`EVAL`=3），
+  同槽约束交给服务端（不同槽返回 `CROSSSLOT`，与 C#/Rust 一致）。
 - 证据：`src/cluster.zig` 5 个单元用例、`src/topology_discovery.zig` 2 个单元用例、`tests/cluster.zig` 1 + `tests/topology_auto.zig` 3 个集成用例
   （含双服务端按槽位真实分流验证）。
 
 ## 六、尚未实现（下一里程碑输入）
 
-1. **其余跨键命令**：`RENAME`/`SMOVE`/`BITOP`/`EVAL` 等需同槽或脚本迁移的命令仍走主池（需 hash tag 约束或客户端拆分）。
-2. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
-3. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
+1. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
+2. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
 
 ## 七、Zig 0.17 实测坑（已规避，勿回退）
 

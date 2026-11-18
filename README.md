@@ -34,7 +34,7 @@ Pek 生态的 **Zig** Redis 客户端 —— 语义与字节格式对齐两个�
 | 服务层 | `RedisRedLock` / `RedisDeferred` / `RedisStat` / `RedisEventBus<T>` | ✅ RedLock（普通 SET + 比较释放）、延迟批处理、流式统计（快照 + 备份库队列）、事件总线 |
 | Stream 消息队列 | `RedisStream` / `Message` | ✅ 基元/对象写入、消费组、确认/挂起/抢夺、延迟死信、裁剪与区间读 |
 | Tair 扩展 | `FullRedis.Ex*` | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
-| 拓扑 | `Clusters/*`（Cluster / Sentinel / Replication / Static） | ✅ 哈希槽/`CLUSTER NODES`/选路/`MOVED` 记忆/`ASK`/健康退避/`INFO` 发现/定时刷新；单键命令与 `MGET`/`DEL` 自动选路（分组），`MSET` 转逐键 SET |
+| 拓扑 | `Clusters/*`（Cluster / Sentinel / Replication / Static） | ✅ 哈希槽/`CLUSTER NODES`/选路/`MOVED` 记忆/`ASK`/健康退避/`INFO` 发现/定时刷新；单键与跨键（按首 key）自动选路，`MGET`/`DEL` 按节点分组 |
 | TLS | `rediss://` / `Ssl` | ⏳ 当前**明确报错**，不降级明文 |
 
 详细对照与缺口见 [`docs/移植对照-NRedis.md`](docs/移植对照-NRedis.md)。

@@ -1382,19 +1382,24 @@ fn anyCmd(cmd: []const u8, comptime names: []const []const u8) bool {
 
 /// 单键命令表（key 固定在第 1 个参数）。
 ///
-/// 约定与 C#/Rust 一致：多键命令（MGET/DEL/mset/RENAME/EVAL/SCAN…）与无键命令
-/// （PING/INFO/CLUSTER…）不路由，避免误发到不持有该 key 的节点。
+/// 约定与 C#/Rust 一致：无键命令（PING/INFO/CLUSTER/SCAN…）不路由；
+/// 跨键命令按**第一个 key** 选路，由服务端在同槽约束下执行（不同槽会返回 CROSSSLOT）。
 const WRITE_CMDS = [_][]const u8{
-    "SET",              "SETEX",           "PSETEX",    "SETNX",   "GETSET",     "GETDEL",
-    "GETEX",            "APPEND",          "INCR",      "DECR",    "INCRBY",     "DECRBY",
-    "INCRBYFLOAT",      "SETRANGE",        "SETBIT",    "EXPIRE",  "PEXPIRE",    "EXPIREAT",
-    "PEXPIREAT",        "PERSIST",         "HSET",      "HSETNX",  "HMSET",      "HDEL",
-    "HINCRBY",          "HINCRBYFLOAT",    "LPUSH",     "RPUSH",   "LPUSHX",     "RPUSHX",
-    "LPOP",             "RPOP",            "LSET",      "LREM",    "LTRIM",      "LINSERT",
-    "SADD",             "SREM",            "SPOP",      "ZADD",    "ZREM",       "ZINCRBY",
-    "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZPOPMIN",   "ZPOPMAX", "XADD",       "XDEL",
-    "XTRIM",            "XACK",            "XCLAIM",    "GEOADD",  "PFADD",      "EXSET",
-    "EXINCRBY",         "EXHSET",          "EXHINCRBY", "EXHDEL",  "EXHPEXPIRE",
+    "SET",              "SETEX",           "PSETEX",      "SETNX",      "GETSET",      "GETDEL",
+    "GETEX",            "APPEND",          "INCR",        "DECR",       "INCRBY",      "DECRBY",
+    "INCRBYFLOAT",      "SETRANGE",        "SETBIT",      "EXPIRE",     "PEXPIRE",     "EXPIREAT",
+    "PEXPIREAT",        "PERSIST",         "HSET",        "HSETNX",     "HMSET",       "HDEL",
+    "HINCRBY",          "HINCRBYFLOAT",    "LPUSH",       "RPUSH",      "LPUSHX",      "RPUSHX",
+    "LPOP",             "RPOP",            "LSET",        "LREM",       "LTRIM",       "LINSERT",
+    "SADD",             "SREM",            "SPOP",        "ZADD",       "ZREM",        "ZINCRBY",
+    "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZPOPMIN",     "ZPOPMAX",    "XADD",        "XDEL",
+    "XTRIM",            "XACK",            "XCLAIM",      "GEOADD",     "PFADD",       "EXSET",
+    "EXINCRBY",         "EXHSET",          "EXHINCRBY",   "EXHDEL",     "EXHPEXPIRE",
+    // 跨键（同槽约束由服务端保证）
+     "RENAME",
+    "RENAMENX",         "COPY",            "SMOVE",       "MSETNX",     "RPOPLPUSH",   "PFMERGE",
+    "BITOP",            "SINTERSTORE",     "SUNIONSTORE", "SDIFFSTORE", "ZUNIONSTORE", "ZINTERSTORE",
+    "ZDIFFSTORE",       "EVAL",            "EVALSHA",
 };
 
 const READ_CMDS = [_][]const u8{
@@ -1408,19 +1413,40 @@ const READ_CMDS = [_][]const u8{
     "XRANGE",    "XPENDING",      "GEODIST",   "GEOPOS",     "GEOHASH",
     "GEOSEARCH", "EXGET",         "EXHGET",    "EXHMGET",    "EXHGETWITHVER",
     "EXHPTTL",   "EXHKEYS",       "EXHVALS",   "EXHLEN",
+    // 跨键读（同槽约束由服务端保证）
+        "SUNION",
+    "SINTER",    "SDIFF",         "ZUNION",    "ZINTER",     "ZDIFF",
+    "PFCOUNT",
 };
+
+/// key 所在参数下标（默认 1；`BITOP` 在 2；`EVAL/EVALSHA` 在 3）。
+fn evKeyIndex(cmd: []const u8, args: []const []const u8) ?usize {
+    if (anyCmd(cmd, &.{"BITOP"})) return if (args.len > 2) 2 else null;
+    if (anyCmd(cmd, &.{ "EVAL", "EVALSHA" })) {
+        if (args.len <= 3) return null;
+        const num_keys = std.fmt.parseInt(usize, args[2], 10) catch return null;
+        if (num_keys == 0) return null;
+        return 3;
+    }
+    return 1;
+}
 
 fn commandRoute(args: []const []const u8, blocking: bool) ?CmdRoute {
     if (args.len < 2) return null;
     const cmd = args[0];
-    const key = args[1];
-    if (key.len == 0 or std.mem.eql(u8, key, "*")) return null;
 
     if (blocking) {
-        // 仅单键阻塞命令；BLMOVE/BRPOPLPUSH 是多键，交给主池
-        if (anyCmd(cmd, &.{ "BLPOP", "BRPOP" })) return .{ .key = key, .write = true };
+        if (anyCmd(cmd, &.{ "BLPOP", "BRPOP", "BRPOPLPUSH", "BLMOVE" })) {
+            return .{ .key = args[1], .write = true };
+        }
         return null;
     }
+
+    const idx = evKeyIndex(cmd, args) orelse return null;
+    if (args.len <= idx) return null;
+    const key = args[idx];
+    if (key.len == 0 or std.mem.eql(u8, key, "*")) return null;
+
     if (anyCmd(cmd, &WRITE_CMDS)) return .{ .key = key, .write = true };
     if (anyCmd(cmd, &READ_CMDS)) return .{ .key = key, .write = false };
     return null;

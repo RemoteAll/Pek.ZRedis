@@ -139,8 +139,17 @@ test "拓扑自动：单键命令按槽位路由到不同服务端" {
     try testing.expectEqual(expect_a, hlen_a.asInt().?);
     try testing.expectEqual(expect_b, hlen_b.asInt().?);
 
+    // 跨键命令：同槽 RENAME 按首 key 选路（`{bar}bar2` 与 `bar` 同槽 5061）
+    var rename_v = try fr.redis.execute(&.{ "RENAME", "bar", "{bar}bar2" });
+    const rename_ok = rename_v.asString() != null and std.mem.eql(u8, rename_v.asString().?, "OK");
+    rename_v.deinit(a);
+    try testing.expect(rename_ok);
+    var renamed = try c1.execute(&.{ "GET", "{bar}bar2" });
+    defer renamed.deinit(a);
+    try testing.expectEqualStrings("v-bar", renamed.asString().?);
+
     // 多键命令：MGET 按节点分组后仍按原 key 顺序汇总
-    const multi = [_][]const u8{ "bar", "foo" };
+    const multi = [_][]const u8{ "{bar}bar2", "foo" };
     const values = try fr.redis.getAllRaw(a, &multi);
     defer {
         for (values) |slot| if (slot) |s| a.free(s);
@@ -151,7 +160,7 @@ test "拓扑自动：单键命令按槽位路由到不同服务端" {
 
     // 多键命令：DEL 跨节点求和
     try testing.expectEqual(@as(i64, 2), try fr.redis.removeMany(&multi));
-    var gone = try c1.execute(&.{ "GET", "bar" });
+    var gone = try c1.execute(&.{ "GET", "{bar}bar2" });
     defer gone.deinit(a);
     try testing.expect(gone.isNull());
 }
