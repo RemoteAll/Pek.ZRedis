@@ -39,6 +39,7 @@ pub const pubsub = @import("pubsub.zig");
 pub const cluster = @import("cluster.zig");
 pub const info = @import("info.zig");
 pub const topology_discovery = @import("topology_discovery.zig");
+pub const interop = @import("interop.zig");
 
 pub const queues = struct {
     pub const base = @import("queues/base.zig");

@@ -115,8 +115,26 @@
 
 ## 六、尚未实现（下一里程碑输入）
 
-1. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
-2. **客户端证书（mTLS）**：当前只做服务端证书校验（`TlsInsecure=1` 跳过），未接客户端证书。
+1. **客户端证书（mTLS）**：当前只做服务端证书校验（`TlsInsecure=1` 跳过），未接客户端证书。
+
+## 六之三、跨语言严格对拍（2026-11-18 第十三轮已落地）
+
+- Zig 侧：`src/interop.zig` + CLI `zredis interop write|verify|clean|report <config> [prefix]`。
+  **写走封装 API**（`RedisHash`/`RedisList`/`RedisSet`/`RedisSortedSet`/`RedisQueue`/`RedisDelayQueue`/
+  `RedisReliableQueue`/`RedisStream`），**校验走裸命令**（GET/HGETALL/LRANGE/SMEMBERS/ZSCORE/LINDEX/ZRANGE/XRANGE），
+  避免「自己写自己读」自证。
+- 外部口径：`tools/interop-strict.ps1` 用 **redis-cli** 作独立裁判，双向验证：
+  ① Zig 写 → redis-cli 读（逐字节断言）；② redis-cli 写（`--pipe` 灌精确 RESP）→ Zig 读；③ Zig 写 → Zig 读（新进程）。
+- 覆盖的契约点：字符串（UTF-8 / **二进制** `00 01 0d 0a 22 ff` / TTL）、计数器、布尔 `True`、时间 `yyyy-MM-dd HH:mm:ss.fff`、
+  哈希、列表保序、集合、**ZSET score 文本**（`1.5` / `-2.25`）、普通队列、延迟队列（`score = now + delay` 秒）、
+  可靠队列主列表、Stream（`id` 形如 `毫秒-序号` + 字段）、锁值 `token|绝对毫秒`（`parseLockExpire` 口径）。
+- 隔离：脚本自建**临时实例**（随机端口 + 临时目录 + `save ""`/`appendonly no`），跑完 `Stop-Process` + 删目录，
+  **绝不碰用户已有实例**（`D:\Redis` 的 6379 有真实数据）。缺 `redis-server`/`redis-cli` 时打 `SKIP` + 原因，不计 PASS。
+- 实测：`RESULT=PASS（21 项检查）`；`zig build unit` **46/46**、`integration` **26/26**。
+- 踩到的环境坑：本机 `D:\Redis\redis-server.exe` 是 **MSYS2 构建**，**不认 Windows 绝对路径**
+  （会把 cwd 前缀拼到参数前 → `can't open config file '/cygdrive/g/.../C:\...'`）；
+  改为「相对配置名 + `-WorkingDirectory`」启动。PS 5.1 下灌二进制（含 `0x0d 0x0a`）必须用 `--pipe` + 字节文件，
+  不能走 argv（会被 ANSI 重编码）。
 
 ## 六之二、TLS 正向往返（2026-11-18 第十二轮已通过）
 

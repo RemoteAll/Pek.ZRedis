@@ -17,7 +17,7 @@
 [CmdletBinding()]
 param(
     # 单元测试基线（新增用例后必须同步抬高）
-    [int]$MinUnit = 44,
+    [int]$MinUnit = 46,
     # 集成测试基线（新增用例后必须同步抬高）
     [int]$MinIntegration = 26
 )
@@ -165,6 +165,37 @@ function Invoke-TlsRoundTrip {
     }
 }
 
+<#
+.SYNOPSIS
+    跨语言严格对拍（调 tools\interop-strict.ps1，自建临时 redis 实例）。
+.DESCRIPTION
+    缺 redis-server/redis-cli 时脚本会自己打 `SKIP: ...` 并退出 0——这里原样透传，不算 PASS。
+#>
+function Invoke-InteropStrict {
+    param([string]$RootPath)
+    $script = Join-Path $RootPath 'tools\interop-strict.ps1'
+    if (-not (Test-Path -LiteralPath $script)) {
+        Write-Line "SKIP: 缺少 tools\interop-strict.ps1"
+        return
+    }
+    Write-Line '== 跨语言严格对拍（tools\interop-strict.ps1） =='
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $code = 1
+    try {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $script -NoBuild 2>&1 | ForEach-Object {
+            $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+            Write-Line $line
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0) {
+        throw "跨语言严格对拍失败（exit $code）"
+    }
+}
+
 try {
     Push-Location $root
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -201,6 +232,8 @@ try {
     Assert-TestCount -Label '集成测试' -Lines $integrationLines -Minimum $MinIntegration
 
     Invoke-TlsRoundTrip -ExePath (Join-Path $root 'zig-out\bin\zredis.exe') -RootPath $root
+
+    Invoke-InteropStrict -RootPath $root
 
     Write-Line 'RESULT=PASS'
     exit 0

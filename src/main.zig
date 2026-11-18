@@ -6,10 +6,12 @@
 //! - `set <config> <key> <text> [expire]`：写入字符串；
 //! - `get <config> <key>`：读取并打印 `VALUE=`（二进制安全用 hex）；
 //! - `info <config>`：打印版本 / 服务器类型；
-//! - `selfcheck <config>`：读写删一轮自检。
+//! - `selfcheck <config>`：读写删一轮自检；
+//! - `interop write|verify|clean|report <config> [prefix]`：跨语言严格对拍（同一实例、同一字节）。
 
 const std = @import("std");
 const pek_zredis = @import("pek_zredis");
+const interop = pek_zredis.interop;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -21,6 +23,22 @@ pub fn main(init: std.process.Init) !void {
 
     const cmd = args.next() orelse return usage();
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help")) return usage();
+
+    if (std.mem.eql(u8, cmd, "interop")) {
+        const mode_text = args.next() orelse return usage();
+        const config = args.next() orelse return usage();
+        const prefix = args.next() orelse "";
+        const mode = std.meta.stringToEnum(interop.Mode, mode_text) orelse {
+            std.debug.print("RESULT=FAIL\nMESSAGE=未知 interop 模式：{s}（write/verify/clean/report）\n", .{mode_text});
+            return;
+        };
+        const failures = interop.run(gpa, io, mode, config, prefix) catch |e| {
+            std.debug.print("RESULT=FAIL\nMESSAGE=对拍执行失败：{s}\n", .{@errorName(e)});
+            return;
+        };
+        std.debug.print("RESULT={s}\n", .{if (failures == 0) "OK" else "FAIL"});
+        return;
+    }
 
     const config = args.next() orelse return usage();
     var r = pek_zredis.Redis.fromConfig(gpa, io, config) catch |e| {
@@ -111,6 +129,7 @@ fn usage() void {
         \\  get       <config> <key>
         \\  info      <config>
         \\  selfcheck <config>
+        \\  interop   <write|verify|clean|report> <config> [prefix]
         \\config 例：server=127.0.0.1:6379;password=123456;db=7;prefix=app:
         \\
     , .{});

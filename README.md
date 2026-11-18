@@ -72,7 +72,8 @@ zig build test                  # 单元 + 集成（回环假 Redis，无需真�
 zig build unit                  # 仅单元测试
 zig build integration           # 仅集成测试
 zig fmt --check src build.zig tests
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\regression.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\regression.ps1            # 一键回归（含 TLS + 对拍）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\interop-strict.ps1        # 跨语言严格对拍（自建临时实例）
 ```
 
 CLI 对拍/运维子命令：
@@ -83,6 +84,10 @@ CLI 对拍/运维子命令：
 .\zig-out\bin\zredis.exe get       "server=127.0.0.1:6379;db=0" user
 .\zig-out\bin\zredis.exe info      "server=127.0.0.1:6379;db=0"
 .\zig-out\bin\zredis.exe selfcheck "server=127.0.0.1:6379;db=0"
+# 跨语言对拍（需真实 Redis；脚本自己起临时实例，不碰已有数据）
+.\zig-out\bin\zredis.exe interop write  "server=127.0.0.1:6379;db=15" pezredis:interop:
+.\zig-out\bin\zredis.exe interop verify "server=127.0.0.1:6379;db=15" pezredis:interop:
+.\zig-out\bin\zredis.exe interop clean  "server=127.0.0.1:6379;db=15" pezredis:interop:
 ```
 
 ## 互通契约（要点）
