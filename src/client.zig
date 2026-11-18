@@ -123,8 +123,11 @@ const TlsState = struct {
     const app_write_len = 8 * 1024;
 
     fn destroy(self: *TlsState, gpa: std.mem.Allocator) void {
-        // close_notify：告知对端正常结束（失败不影响关闭）
+        // close_notify：告知对端正常结束（失败不影响关闭）。
+        // `end()` 同样只把告警写进 socket 写缓冲，必须再冲刷一次，否则对端只看到 TCP FIN
+        // → 判定为截断攻击（TlsConnectionTruncated）。
         self.client.end() catch {};
+        self.stream_writer.interface.flush() catch {};
         self.ca.deinit(gpa);
         gpa.free(self.bufs);
         gpa.destroy(self);
@@ -557,6 +560,14 @@ pub const Client = struct {
                 self.diag.set("TLS flush 失败（{s}）：{s}", .{ cfgName(self.cfg), @errorName(e) });
                 return error.IoError;
             };
+            // ★ 关键：`tls.Client.writer.flush()` 只把**密文**写进 `output`（socket 写缓冲），
+            // 并不会冲刷 socket 本身（见 zzig `tls_client.zig` 的 `flush`，只有 `init` 末尾会 flush）。
+            // 少这一步命令会停在 16 KB 写缓冲里发不出去：实测对端 TLS 握手成功但一个应用层字节都收不到。
+            st.stream_writer.interface.flush() catch |e| {
+                self.broken = true;
+                self.diag.set("TLS 底层 socket 冲刷失败（{s}，{d} 字节）：{s}", .{ cfgName(self.cfg), bytes.len, @errorName(e) });
+                return error.IoError;
+            };
             return;
         }
 
@@ -600,7 +611,11 @@ pub const Client = struct {
             },
             error.ConnectionClosed => {
                 self.broken = true;
-                self.diag.set("连接被对端关闭（{s}）", .{cfgName(self.cfg)});
+                if (self.reader.tls_read_err.len != 0) {
+                    self.diag.set("TLS 对端已关闭（{s}）：{s}", .{ cfgName(self.cfg), self.reader.tls_read_err });
+                } else {
+                    self.diag.set("连接被对端关闭（{s}）", .{cfgName(self.cfg)});
+                }
                 return error.Protocol;
             },
             error.MessageTooLarge => {
@@ -615,7 +630,18 @@ pub const Client = struct {
             },
             error.Io => {
                 self.broken = true;
-                self.diag.set("读 socket 失败（{s}）", .{cfgName(self.cfg)});
+                if (self.reader.tls_read_err.len != 0) {
+                    // `ReadFailed` 本身没信息量，真因（TlsBadRecordMac / TlsAlert …）在 client.read_err
+                    if (self.tls) |st| {
+                        if (st.client.read_err) |re| {
+                            self.diag.set("TLS 读取失败（{s}）：{s}（{s}）", .{ cfgName(self.cfg), self.reader.tls_read_err, @errorName(re) });
+                            return error.IoError;
+                        }
+                    }
+                    self.diag.set("TLS 读取失败（{s}）：{s}", .{ cfgName(self.cfg), self.reader.tls_read_err });
+                } else {
+                    self.diag.set("读 socket 失败（{s}）", .{cfgName(self.cfg)});
+                }
                 return error.IoError;
             },
         };

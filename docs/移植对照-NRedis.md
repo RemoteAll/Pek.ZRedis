@@ -33,7 +33,7 @@
 | 服务层 | `Services/*`（Stat / Deferred / RedLock / EventBus） | `services.rs` | `src/services/{stat,deferred,redlock,eventbus}.zig` | ✅ RedLock/延迟批处理/流式统计/事件总线 |
 | Tair 扩展 | `FullRedis.Ex*` | `tair.rs` | `src/full.zig`（`Ex*`） | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
 | 拓扑 | `Clusters/*`（Cluster/Sentinel/Replication） | `cluster/*` | `src/cluster.zig` + `src/topology_discovery.zig` | ✅ 槽位/节点解析/选路/重定向/健康退避/INFO 发现；自动刷新 ⏳ |
-| TLS | `Ssl` / `rediss://` | rustls | `src/client.zig`（`zzig.tls_client`） | ✅ 握手/读写接入，`TlsInsecure` 与系统根证书校验；正向待真实服务端 |
+| TLS | `Ssl` / `rediss://` | rustls | `src/client.zig`（`zzig.tls_client`） | ✅ 握手/读写接入；正向 PING/SET/GET 已验证（`tools/regression.ps1` TLS 阶段） |
 | 异步 API | `*Async`（.NET） | `async_api.rs`（tokio） | — | ➖ Zig 侧不 1:1 迁移（由调用方线程模型决定） |
 | ASP.NET 集成 | `RedisCacheProvider` / `CacheExtensions` | 不迁移 | — | ➖ .NET 宿主专属 |
 
@@ -115,9 +115,25 @@
 
 ## 六、尚未实现（下一里程碑输入）
 
-1. **TLS 正向验证**：已接入 `zzig.tls_client`（握手/读写/`TlsInsecure`/系统根证书、失败 `error.Tls` 不降级），
-   但当前无 TLS 测试服务端，`rediss://` 正向往返（含自签/客户端证书）仍需真实环境验证。
-2. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
+1. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
+2. **客户端证书（mTLS）**：当前只做服务端证书校验（`TlsInsecure=1` 跳过），未接客户端证书。
+
+## 六之二、TLS 正向往返（2026-11-18 第十二轮已通过）
+
+- 夹具：`tests/support/tls/`（openssl 自签 SAN `localhost`/`127.0.0.1` 10 年 + 最小 TLS RESP 服务端，键空间进程级共享）。
+- 入口：`tools/regression.ps1` 的 `Invoke-TlsRoundTrip`（缺 python/夹具时打 `SKIP` + 原因，不计 PASS）。
+- 实测：`TLS PING / SET / GET` 全 `RESULT=OK`，`GET` 取回 `LEN=5 VALUE=world`；`zig build unit` **44/44**、`integration` **26/26**。
+- **根因（两处，缺一不可）**：
+  1. **写**：`tls_client.Client.writer.flush()` 只把密文写进 `output`（socket 写缓冲），**不冲刷 socket**
+     （zzig `tls_client.zig` 的 `flush`/`end` 均如此，只有 `init` 末尾 `output.flush()`）。
+     → `client.writeAll` 在 `writer.flush()` 后必须再 `stream_writer.interface.flush()`；`TlsState.destroy` 发 close_notify 后同理。
+  2. **读**：`std.Io.Reader` 允许实现「忽略 `data`、写自身缓冲并 `return 0`」，zzig TLS 客户端正是该形态
+     （应用数据 `r.end += cleartext.len` 后 `return 0`；`NewSessionTicket` 也 `return 0`）。
+     → 用 `peekGreedy(1)` 取明文、`toss(n)` 消费；**「返回 0」不是 EOF**，只有 close_notify 才是。
+- 取证方式：带阶段日志的诊断 TLS 服务端打印 `accepted / handshake_ok / recv hex / recv_eof`，
+  一眼看出「握手成功但零应用字节」→ 写方向缓冲未冲刷；随后的 `readVec n=0 tls_buffered=0` 定位读方向误判。
+- 回归护栏：`src/resp.zig`「TLS 明文读取：实现写自身缓冲并返回 0 时不能当成 EOF」用 mock 复刻该实现，
+  **撤掉修复该用例失败**（实测 43/44），恢复后 44/44。
 
 ## 七、Zig 0.17 实测坑（已规避，勿回退）
 

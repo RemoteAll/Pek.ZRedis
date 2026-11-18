@@ -206,6 +206,8 @@ pub const Reader = struct {
     stream: std.Io.net.Stream,
     /// 非空时从 TLS 明文流读取（`zzig.tls_client.Client.reader`），否则直读 socket
     tls_reader: ?*std.Io.Reader = null,
+    /// 最近一次 TLS 读取的错误名（诊断用：对外统一映射成 `Io` 会丢掉 TLS 具体原因）
+    tls_read_err: []const u8 = "",
     buf: []u8,
     start: usize = 0,
     end: usize = 0,
@@ -253,11 +255,26 @@ pub const Reader = struct {
 
     fn readSome(self: *Reader, dst: []u8) Error!usize {
         if (self.tls_reader) |tls_reader| {
-            var tls_slices = [_][]u8{dst};
-            const n = tls_reader.readVec(&tls_slices) catch |e| switch (e) {
-                error.EndOfStream => return 0,
-                else => return error.Io,
+            // ★ TLS 明文流**不能**用 `readVec(&.{dst})`：`std.Io.Reader.readVec` 允许实现
+            // 「忽略 data、把明文写进自身缓冲并返回 0」（zzig `tls_client.zig` 正是如此：
+            // 应用数据 `r.end += cleartext.len` 后 return 0，NewSessionTicket 也是 return 0）。
+            // 之前把「返回 0」当成 EOF，导致握手成功后第一次读就被判成 `ConnectionClosed`
+            // → `Protocol`（实测：服务端已收到 PING 并回了 +PONG，客户端却报对端关闭）。
+            // 正确姿势是 `peekGreedy(1)`：内部用 vtable.readVec 填充自身缓冲，直到真有
+            // 至少 1 字节明文，或真的收到 close_notify（EndOfStream）。
+            const avail = tls_reader.peekGreedy(1) catch |e| {
+                // TLS 具体原因（TlsAlert / TlsBadRecordMac / TlsConnectionTruncated …）
+                // 在这一层还能看到，映射成 Io 后上层就分不清「对端关连接」还是「记录校验失败」。
+                self.tls_read_err = @errorName(e);
+                return switch (e) {
+                    error.EndOfStream => 0,
+                    else => error.Io,
+                };
             };
+            const n = @min(avail.len, dst.len);
+            @memcpy(dst[0..n], avail[0..n]);
+            tls_reader.toss(n);
+            self.tls_read_err = "";
             return n;
         }
 
@@ -577,4 +594,59 @@ test "解析 RESP3 扩展类型" {
 test "非法协议标记报 Protocol" {
     try testing.expectError(error.Protocol, decodeBytes(testing.allocator, "?bad\r\n"));
     try testing.expectError(error.Protocol, decodeBytes(testing.allocator, "$\r\n"));
+}
+
+/// 模拟 zzig `tls_client.zig` 的 Reader 实现：**忽略** `data`，把明文字节写进自身缓冲，
+/// 并且一律 `return 0`（应用数据与 NewSessionTicket 都是这个行为）。
+const TlsLikeSource = struct {
+    var source: []const u8 = "";
+    var pos: usize = 0;
+
+    fn streamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = r;
+        _ = w;
+        _ = limit;
+        return error.ReadFailed;
+    }
+
+    fn readVecImpl(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        _ = data;
+        if (pos >= source.len) return error.EndOfStream;
+        const n = @min(source.len - pos, r.buffer.len - r.end);
+        if (n == 0) return 0;
+        @memcpy(r.buffer[r.end..][0..n], source[pos..][0..n]);
+        r.end += n;
+        pos += n;
+        return 0;
+    }
+};
+
+test "TLS 明文读取：实现写自身缓冲并返回 0 时不能当成 EOF" {
+    const gpa = testing.allocator;
+    TlsLikeSource.source = "+PONG\r\n";
+    TlsLikeSource.pos = 0;
+
+    var tls_buf: [32]u8 = undefined;
+    var tls_reader = std.Io.Reader{
+        .buffer = &tls_buf,
+        .vtable = &.{ .stream = TlsLikeSource.streamImpl, .readVec = TlsLikeSource.readVecImpl },
+        .seek = 0,
+        .end = 0,
+    };
+
+    var r = Reader{
+        .gpa = gpa,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .stream = undefined,
+        .tls_reader = &tls_reader,
+        .buf = try gpa.alloc(u8, 64),
+    };
+    defer r.deinit();
+
+    var v = try r.readReply();
+    defer v.deinit(gpa);
+    try testing.expectEqualStrings("PONG", v.asString().?);
+
+    // 真正的 close_notify（这里由 EndOfStream 模拟）才算关闭
+    try testing.expectError(error.ConnectionClosed, r.readReply());
 }

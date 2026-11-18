@@ -2,12 +2,30 @@
 """最小 TLS Redis 服务端（仅供 Pek.ZRedis 本地正向测试）。
 
 支持 PING / SET / GET / DEL / SELECT / AUTH / QUIT，其余返回 -ERR。
+键空间是**进程级共享**的（跨连接可见），这样 CLI 每次单独建连也能验证 SET → GET 的往返。
+
 用法: python tls_redis_server.py <port> <cert.pem> <key.pem>
 """
 
 import socket
 import ssl
 import sys
+
+# 跨连接共享的键空间
+STORE = {}
+
+
+def read_exact(f, n):
+    """从底层套接字读满 n 字节（RawIOBase.read 可能短路，不能直接信）。"""
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = f.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def read_command(f):
@@ -23,8 +41,10 @@ def read_command(f):
         if not head.startswith(b"$"):
             return None
         length = int(head[1:])
-        data = f.read(length)
-        f.read(2)  # CRLF
+        data = read_exact(f, length)
+        if data is None:
+            return None
+        read_exact(f, 2)  # CRLF
         parts.append(data)
     return parts
 
@@ -36,7 +56,6 @@ def bulk(value):
 
 
 def handle(conn):
-    store = {}
     f = conn.makefile("rwb", buffering=0)
     while True:
         parts = read_command(f)
@@ -51,14 +70,14 @@ def handle(conn):
         elif cmd in (b"SELECT", b"AUTH"):
             f.write(b"+OK\r\n")
         elif cmd == b"SET":
-            store[parts[1]] = parts[2]
+            STORE[parts[1]] = parts[2]
             f.write(b"+OK\r\n")
         elif cmd == b"GET":
-            f.write(bulk(store.get(parts[1])))
+            f.write(bulk(STORE.get(parts[1])))
         elif cmd == b"DEL":
             removed = 0
             for key in parts[1:]:
-                if store.pop(key, None) is not None:
+                if STORE.pop(key, None) is not None:
                     removed += 1
             f.write(b":%d\r\n" % removed)
         else:

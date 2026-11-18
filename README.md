@@ -35,7 +35,7 @@ Pek 生态的 **Zig** Redis 客户端 —— 语义与字节格式对齐两个�
 | Stream 消息队列 | `RedisStream` / `Message` | ✅ 基元/对象写入、消费组、确认/挂起/抢夺、延迟死信、裁剪与区间读 |
 | Tair 扩展 | `FullRedis.Ex*` | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
 | 拓扑 | `Clusters/*`（Cluster / Sentinel / Replication / Static） | ✅ 哈希槽/`CLUSTER NODES`/选路/`MOVED` 记忆/`ASK`/健康退避/`INFO` 发现/定时刷新；单键与跨键（按首 key）自动选路，`MGET`/`DEL` 按节点分组 |
-| TLS | `rediss://` / `Ssl` | ✅ 接入 `zzig.tls_client`（`TlsInsecure` / 系统根证书校验，握手失败 `error.Tls` **不降级**）；真实服务端正向往返待验证 |
+| TLS | `rediss://` / `Ssl` | ✅ 接入 `zzig.tls_client`（`TlsInsecure` / 系统根证书校验，握手失败 `error.Tls` **不降级**）；正向 PING/SET/GET 已在 `tools/regression.ps1` TLS 阶段实测通过 |
 
 详细对照与缺口见 [`docs/移植对照-NRedis.md`](docs/移植对照-NRedis.md)。
 

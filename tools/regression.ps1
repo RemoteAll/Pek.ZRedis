@@ -17,7 +17,7 @@
 [CmdletBinding()]
 param(
     # 单元测试基线（新增用例后必须同步抬高）
-    [int]$MinUnit = 43,
+    [int]$MinUnit = 44,
     # 集成测试基线（新增用例后必须同步抬高）
     [int]$MinIntegration = 26
 )
@@ -82,6 +82,89 @@ function Assert-TestCount {
     Write-Line "PASS: $Label $passed/$total（基线 $Minimum）"
 }
 
+<#
+.SYNOPSIS
+    TLS 正向往返（PING / SET / GET）：起最小 TLS RESP 服务端，用 CLI 走真实 TLS 连接。
+.DESCRIPTION
+    缺口具（python / 证书）时显式打 SKIP + 原因，**不计 PASS**，不允许静默跳过。
+#>
+function Invoke-TlsRoundTrip {
+    param(
+        [string]$ExePath,
+        [string]$RootPath
+    )
+    $serverScript = Join-Path $RootPath 'tests\support\tls\tls_redis_server.py'
+    $cert = Join-Path $RootPath 'tests\support\tls\cert.pem'
+    $key = Join-Path $RootPath 'tests\support\tls\key.pem'
+    foreach ($path in @($serverScript, $cert, $key)) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            Write-Line "SKIP: TLS 正向用例缺少夹具（$path）"
+            return
+        }
+    }
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        Write-Line "SKIP: TLS 正向用例需要 CLI 产物（$ExePath）"
+        return
+    }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) {
+        Write-Line "SKIP: TLS 正向用例需要 python（ssl 模块），本机未找到 python"
+        return
+    }
+
+    # 取一个空闲端口（先绑 0 再释放，避免与在跑的服务撞口）
+    $probe = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $probe.Start()
+    $port = ([System.Net.IPEndPoint]$probe.LocalEndpoint).Port
+    $probe.Stop()
+
+    $logDir = Join-Path $RootPath 'artifacts\regression'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $outLog = Join-Path $logDir "tls-server-$port.out.log"
+    $errLog = Join-Path $logDir "tls-server-$port.err.log"
+
+    Write-Line "== TLS 正向（127.0.0.1:$port） =="
+    $server = Start-Process -FilePath $python.Source `
+        -ArgumentList @($serverScript, "$port", $cert, $key) `
+        -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    try {
+        $ready = $false
+        for ($i = 0; $i -lt 100; $i++) {
+            Start-Sleep -Milliseconds 100
+            if (Test-Path -LiteralPath $outLog) {
+                $text = Get-Content -LiteralPath $outLog -Raw -Encoding UTF8
+                if ($text -and $text.Contains('ready')) { $ready = $true; break }
+            }
+            if ($server.HasExited) { break }
+        }
+        if (-not $ready) {
+            $stderr = if (Test-Path -LiteralPath $errLog) { Get-Content -LiteralPath $errLog -Raw -Encoding UTF8 } else { '' }
+            throw "TLS 夹具服务端 10s 内未就绪（端口 $port，stderr: $stderr）"
+        }
+
+        $conn = "server=127.0.0.1:$port;Tls=1;TlsInsecure=1;timeout=3000"
+        $pingLines = Invoke-External -Label 'TLS PING' -Exe $ExePath -Arguments @('ping', $conn)
+        if (($pingLines -join "`n") -notmatch 'RESULT=OK') {
+            throw "TLS PING 未返回 RESULT=OK：$($pingLines -join ' ')"
+        }
+        $setLines = Invoke-External -Label 'TLS SET' -Exe $ExePath -Arguments @('set', $conn, 'hello', 'world')
+        if (($setLines -join "`n") -notmatch 'RESULT=OK') {
+            throw "TLS SET 未返回 RESULT=OK：$($setLines -join ' ')"
+        }
+        $getLines = Invoke-External -Label 'TLS GET' -Exe $ExePath -Arguments @('get', $conn, 'hello')
+        $getText = $getLines -join "`n"
+        if ($getText -notmatch 'RESULT=OK' -or $getText -notmatch 'VALUE=world') {
+            throw "TLS GET 未取回 world：$($getLines -join ' ')"
+        }
+        Write-Line "PASS: TLS 正向 PING / SET / GET（127.0.0.1:$port）"
+    } finally {
+        if ($server -and -not $server.HasExited) {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 try {
     Push-Location $root
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -116,6 +199,8 @@ try {
     if (Test-Path $cache) { Remove-Item -Recurse -Force $cache }
     $integrationLines = Invoke-External -Label 'zig build integration' -Exe 'zig' -Arguments @('build', 'integration', '--summary', 'all', '--cache-dir', $cache)
     Assert-TestCount -Label '集成测试' -Lines $integrationLines -Minimum $MinIntegration
+
+    Invoke-TlsRoundTrip -ExePath (Join-Path $root 'zig-out\bin\zredis.exe') -RootPath $root
 
     Write-Line 'RESULT=PASS'
     exit 0
