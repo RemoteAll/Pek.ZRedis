@@ -19,6 +19,10 @@ const set_mod = @import("set.zig");
 const sortedset_mod = @import("sortedset.zig");
 const stack_mod = @import("stack.zig");
 const hll_mod = @import("hyperloglog.zig");
+const queue_mod = @import("queues/queue.zig");
+const delay_mod = @import("queues/delay.zig");
+const reliable_mod = @import("queues/reliable.zig");
+const deferred_mod = @import("services/deferred.zig");
 
 pub const Redis = redis_mod.Redis;
 pub const Error = redis_mod.Error;
@@ -360,6 +364,255 @@ pub const FullRedis = struct {
         const k = try self.keyAlloc(key);
         defer self.gpa.free(k);
         return hll_mod.HyperLogLog.init(&self.redis, k);
+    }
+
+    pub fn getQueue(self: *FullRedis, topic: []const u8) !queue_mod.RedisQueue {
+        const k = try self.keyAlloc(topic);
+        defer self.gpa.free(k);
+        return queue_mod.RedisQueue.init(&self.redis, k);
+    }
+
+    pub fn getDelayQueue(self: *FullRedis, topic: []const u8) !delay_mod.RedisDelayQueue {
+        const k = try self.keyAlloc(topic);
+        defer self.gpa.free(k);
+        return delay_mod.RedisDelayQueue.init(&self.redis, k);
+    }
+
+    pub fn getReliableQueue(self: *FullRedis, topic: []const u8) !reliable_mod.RedisReliableQueue {
+        const k = try self.keyAlloc(topic);
+        defer self.gpa.free(k);
+        return reliable_mod.RedisReliableQueue.init(&self.redis, k, self.prefix);
+    }
+
+    pub fn getDeferred(self: *FullRedis, name: []const u8) !deferred_mod.RedisDeferred {
+        const k = try self.keyAlloc(name);
+        defer self.gpa.free(k);
+        return deferred_mod.RedisDeferred.init(&self.redis, k);
+    }
+
+    /// 同一实例、指定 db 的新 FullRedis（保留前缀，与 C# `CreateSub` 一致）。
+    pub fn createSub(self: *FullRedis, db: i32) !FullRedis {
+        var opts = options.Options.init(self.gpa);
+        errdefer opts.deinit();
+        for (self.redis.opts.servers.items) |s| {
+            try opts.servers.append(self.gpa, try self.gpa.dupe(u8, s));
+        }
+        if (self.redis.opts.password) |p| opts.password = try self.gpa.dupe(u8, p);
+        if (self.redis.opts.user_name) |u| opts.user_name = try self.gpa.dupe(u8, u);
+        if (self.redis.opts.prefix) |p| opts.prefix = try self.gpa.dupe(u8, p);
+        opts.db = db;
+        opts.timeout_ms = self.redis.opts.timeout_ms;
+        opts.retry = self.redis.opts.retry;
+        opts.protocol_version = self.redis.opts.protocol_version;
+        opts.max_message_size = self.redis.opts.max_message_size;
+        opts.expire = self.redis.opts.expire;
+        opts.pool = self.redis.opts.pool;
+        opts.tls = self.redis.opts.tls;
+        opts.tls_insecure = self.redis.opts.tls_insecure;
+        return init(self.gpa, self.redis.io, opts);
+    }
+
+    pub fn rename(self: *FullRedis, key: []const u8, new_key: []const u8, overwrite: bool) Error!bool {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        const nk = try self.keyAlloc(new_key);
+        defer self.gpa.free(nk);
+        return self.redis.rename(k, nk, overwrite);
+    }
+
+    // ───────────────────────── Tair 扩展（阿里云）─────────────────────────
+
+    /// TairString：带版本号写入（`EXSET key value [EX n] VER v`）。
+    pub fn exSet(self: *FullRedis, key: []const u8, value: anytype, version: i64, expire_seconds: i32) Error!?[]u8 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        const maybe = encoder.encodeValueAlloc(self.gpa, value) catch return error.Type;
+        defer if (maybe) |p| self.gpa.free(p);
+        const payload: []const u8 = if (maybe) |p| p else "";
+
+        var vb: [24]u8 = undefined;
+        const ver = std.fmt.bufPrint(&vb, "{d}", .{version}) catch return error.Config;
+        var v = if (expire_seconds > 0) blk: {
+            var eb: [24]u8 = undefined;
+            const ex = std.fmt.bufPrint(&eb, "{d}", .{expire_seconds}) catch return error.Config;
+            break :blk try self.redis.execute(&.{ "EXSET", k, payload, "EX", ex, "VER", ver });
+        } else try self.redis.execute(&.{ "EXSET", k, payload, "VER", ver });
+        defer v.deinit(self.gpa);
+        const s = v.asString() orelse return null;
+        return try self.gpa.dupe(u8, s);
+    }
+
+    pub const ExValue = struct { value: ?[]u8, version: i64 };
+
+    /// TairString：读取值及版本（`EXGET`）。
+    pub fn exGet(self: *FullRedis, key: []const u8) Error!?ExValue {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var v = try self.redis.execute(&.{ "EXGET", k });
+        defer v.deinit(self.gpa);
+        const items = v.asArray() orelse return null;
+        if (items.len < 2) return null;
+        const version = items[items.len - 1].asInt() orelse 0;
+        const value = items[0].asBytesAlloc(self.gpa) catch return error.IoError;
+        return .{ .value = value, .version = version };
+    }
+
+    pub const ExIncr = struct { value: i64, version: i64 };
+
+    pub fn exIncrBy(self: *FullRedis, key: []const u8, delta: i64, version: i64, expire_seconds: i32) Error!?ExIncr {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var ib: [24]u8 = undefined;
+        var vb: [24]u8 = undefined;
+        const inc = std.fmt.bufPrint(&ib, "{d}", .{delta}) catch return error.Config;
+        const ver = std.fmt.bufPrint(&vb, "{d}", .{version}) catch return error.Config;
+        var v = if (expire_seconds > 0) blk: {
+            var eb: [24]u8 = undefined;
+            const ex = std.fmt.bufPrint(&eb, "{d}", .{expire_seconds}) catch return error.Config;
+            break :blk try self.redis.execute(&.{ "EXINCRBY", k, inc, "EX", ex, "VER", ver });
+        } else try self.redis.execute(&.{ "EXINCRBY", k, inc, "VER", ver });
+        defer v.deinit(self.gpa);
+        const items = v.asArray() orelse return null;
+        if (items.len < 2) return null;
+        return .{ .value = items[0].asInt() orelse 0, .version = items[1].asInt() orelse 0 };
+    }
+
+    pub fn exHSet(self: *FullRedis, key: []const u8, field: []const u8, value: anytype, expire_seconds: i32, nx: bool, ver: i64) Error!i64 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        const maybe = encoder.encodeValueAlloc(self.gpa, value) catch return error.Type;
+        defer if (maybe) |p| self.gpa.free(p);
+        const payload: []const u8 = if (maybe) |p| p else "";
+
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.gpa);
+        try args.append(self.gpa, "EXHSET");
+        try args.append(self.gpa, k);
+        try args.append(self.gpa, field);
+        try args.append(self.gpa, payload);
+        var eb: [24]u8 = undefined;
+        var vb: [24]u8 = undefined;
+        if (expire_seconds > 0) {
+            try args.append(self.gpa, "EX");
+            try args.append(self.gpa, std.fmt.bufPrint(&eb, "{d}", .{expire_seconds}) catch return error.Config);
+        }
+        if (nx) try args.append(self.gpa, "NX");
+        if (ver > 0) {
+            try args.append(self.gpa, "VER");
+            try args.append(self.gpa, std.fmt.bufPrint(&vb, "{d}", .{ver}) catch return error.Config);
+        }
+        var v = try self.redis.execute(args.items);
+        defer v.deinit(self.gpa);
+        return v.asInt() orelse 0;
+    }
+
+    pub fn exHGet(self: *FullRedis, gpa: std.mem.Allocator, key: []const u8, field: []const u8) Error!?[]u8 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var v = try self.redis.execute(&.{ "EXHGET", k, field });
+        defer v.deinit(self.gpa);
+        if (v.isNull()) return null;
+        return v.asBytesAlloc(gpa) catch return error.IoError;
+    }
+
+    pub fn exHMGet(self: *FullRedis, gpa: std.mem.Allocator, key: []const u8, fields: []const []const u8) Error![]?[]u8 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.gpa);
+        try args.append(self.gpa, "EXHMGET");
+        try args.append(self.gpa, k);
+        try args.appendSlice(self.gpa, fields);
+        var v = try self.redis.execute(args.items);
+        defer v.deinit(self.gpa);
+        const items = try self.redis.expectArray(&v);
+
+        const out = gpa.alloc(?[]u8, items.len) catch return error.IoError;
+        errdefer gpa.free(out);
+        for (items, 0..) |item, i| {
+            out[i] = if (item.isNull()) null else (item.asBytesAlloc(gpa) catch return error.IoError);
+        }
+        return out;
+    }
+
+    pub fn exHGetWithVer(self: *FullRedis, key: []const u8, field: []const u8) Error!?ExValue {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var v = try self.redis.execute(&.{ "EXHGETWITHVER", k, field });
+        defer v.deinit(self.gpa);
+        const items = v.asArray() orelse return null;
+        if (items.len < 2) return null;
+        const version = items[items.len - 1].asInt() orelse 0;
+        const value = items[0].asBytesAlloc(self.gpa) catch return error.IoError;
+        return .{ .value = value, .version = version };
+    }
+
+    pub fn exHIncrBy(self: *FullRedis, key: []const u8, field: []const u8, delta: i64, expire_seconds: i32) Error!i64 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var ib: [24]u8 = undefined;
+        const inc = std.fmt.bufPrint(&ib, "{d}", .{delta}) catch return error.Config;
+        var v = if (expire_seconds > 0) blk: {
+            var eb: [24]u8 = undefined;
+            const ex = std.fmt.bufPrint(&eb, "{d}", .{expire_seconds}) catch return error.Config;
+            break :blk try self.redis.execute(&.{ "EXHINCRBY", k, field, inc, "EX", ex });
+        } else try self.redis.execute(&.{ "EXHINCRBY", k, field, inc });
+        defer v.deinit(self.gpa);
+        return v.asInt() orelse 0;
+    }
+
+    pub fn exHPttl(self: *FullRedis, key: []const u8, field: []const u8) Error!i64 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var v = try self.redis.execute(&.{ "EXHPTTL", k, field });
+        defer v.deinit(self.gpa);
+        return v.asInt() orelse -2;
+    }
+
+    fn exStringList(self: *FullRedis, gpa: std.mem.Allocator, cmd: []const u8, key: []const u8) Error![][]u8 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var v = try self.redis.execute(&.{ cmd, k });
+        defer v.deinit(self.gpa);
+        const items = try self.redis.expectArray(&v);
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |s| gpa.free(s);
+            out.deinit(gpa);
+        }
+        for (items) |item| {
+            if (item.asString()) |s| try out.append(gpa, try gpa.dupe(u8, s));
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    pub fn exHKeys(self: *FullRedis, gpa: std.mem.Allocator, key: []const u8) Error![][]u8 {
+        return self.exStringList(gpa, "EXHKEYS", key);
+    }
+
+    pub fn exHVals(self: *FullRedis, gpa: std.mem.Allocator, key: []const u8) Error![][]u8 {
+        return self.exStringList(gpa, "EXHVALS", key);
+    }
+
+    pub fn exHLen(self: *FullRedis, key: []const u8) Error!i64 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var v = try self.redis.execute(&.{ "EXHLEN", k });
+        defer v.deinit(self.gpa);
+        return v.asInt() orelse 0;
+    }
+
+    pub fn exHDel(self: *FullRedis, key: []const u8, fields: []const []const u8) Error!i64 {
+        const k = try self.keyAlloc(key);
+        defer self.gpa.free(k);
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.gpa);
+        try args.append(self.gpa, "EXHDEL");
+        try args.append(self.gpa, k);
+        try args.appendSlice(self.gpa, fields);
+        var v = try self.redis.execute(args.items);
+        defer v.deinit(self.gpa);
+        return v.asInt() orelse 0;
     }
 };
 

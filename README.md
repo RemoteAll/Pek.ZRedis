@@ -30,8 +30,10 @@ Pek 生态的 **Zig** Redis 客户端 —— 语义与字节格式对齐两个�
 | 结构体 | `RedisHash` / `RedisList` / `RedisSet` / `RedisSortedSet` / `RedisStack` | ✅ 常用命令面对齐（含阻塞出队、扫描、范围与排名） |
 | `RedisGeo` / `HyperLogLog` | 同名 | ✅ 常用命令面 |
 | `PubSub` | `PubSub` | ✅ 订阅 / 模式订阅 / 消息读取 |
-| 队列 / Stream / 服务层 | `RedisQueue` / `RedisReliableQueue` / `RedisDelayQueue` / `RedisStream` / `Services` | ⏳ 下一里程碑 |
-| Tair 扩展 | `FullRedis.Ex*` | ⏳ 下一里程碑 |
+| 队列 | `RedisQueue` / `RedisDelayQueue` / `RedisReliableQueue` | ✅ 普通/延迟/可靠队列：确认、回滚、死信、发布消费、延迟补投、错误计数（备份库） |
+| 服务层 | `RedisRedLock` / `RedisDeferred` / `RedisStat` | ✅ RedLock（普通 SET + 比较释放）、延迟批处理、流式统计（快照 + 备份库队列） |
+| Tair 扩展 | `FullRedis.Ex*` | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
+| Stream / EventBus | `RedisStream` / `EventBus` | ⏳ 下一里程碑 |
 | Cluster / Sentinel / Replication | `Clusters` | ⏳ 下一里程碑 |
 | TLS | `rediss://` / `Ssl` | ⏳ 当前**明确报错**，不静默降级明文 |
 

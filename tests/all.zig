@@ -8,6 +8,10 @@ const support = @import("support/mock_redis.zig");
 const testing = std.testing;
 const MockServer = support.MockServer;
 
+test {
+    _ = @import("queues_services.zig");
+}
+
 const IoHolder = struct {
     threaded: std.Io.Threaded,
     io: std.Io,

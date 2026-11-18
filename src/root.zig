@@ -37,6 +37,20 @@ pub const geo = @import("geo.zig");
 pub const hyperloglog = @import("hyperloglog.zig");
 pub const pubsub = @import("pubsub.zig");
 
+pub const queues = struct {
+    pub const base = @import("queues/base.zig");
+    pub const status = @import("queues/status.zig");
+    pub const queue = @import("queues/queue.zig");
+    pub const delay = @import("queues/delay.zig");
+    pub const reliable = @import("queues/reliable.zig");
+};
+
+pub const services = struct {
+    pub const redlock = @import("services/redlock.zig");
+    pub const deferred = @import("services/deferred.zig");
+    pub const stat = @import("services/stat.zig");
+};
+
 pub const Redis = redis.Redis;
 pub const FullRedis = full.FullRedis;
 pub const RedisHash = hash.RedisHash;
@@ -47,6 +61,15 @@ pub const RedisStack = stack.RedisStack;
 pub const RedisGeo = geo.RedisGeo;
 pub const HyperLogLog = hyperloglog.HyperLogLog;
 pub const PubSub = pubsub.PubSub;
+pub const RedisQueue = queues.queue.RedisQueue;
+pub const RedisDelayQueue = queues.delay.RedisDelayQueue;
+pub const RedisReliableQueue = queues.reliable.RedisReliableQueue;
+pub const QueueSettings = queues.base.Settings;
+pub const QueueStatus = queues.status.QueueStatus;
+pub const RedisDeferred = services.deferred.RedisDeferred;
+pub const RedisStat = services.stat.RedisStat;
+pub const RedLock = services.redlock.RedLock;
+pub const acquireRedLock = services.redlock.acquireRedLock;
 pub const Client = client.Client;
 pub const Pool = pool.Pool;
 pub const Value = resp.Value;

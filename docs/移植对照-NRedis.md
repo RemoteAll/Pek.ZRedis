@@ -26,12 +26,12 @@
 | Geo | `RedisGeo.cs` | `geo.rs` | `src/geo.zig` | ✅ 常用面（GEOADD/GEODIST/GEOPOS/GEOHASH/GEORADIUS） |
 | HyperLogLog | `HyperLogLog.cs` | `hyperloglog.rs` | `src/hyperloglog.zig` | ✅ PFADD/PFCOUNT/PFMERGE |
 | 发布订阅 | `PubSub.cs` | `pubsub.rs` | `src/pubsub.zig` | ✅ 订阅/模式订阅/消息读取（独立连接） |
-| 队列 | `RedisQueue.cs` | `queues/queue.rs` | — | ⏳ 下一里程碑 |
-| 可靠队列 | `RedisReliableQueue.cs` | `queues/reliable.rs` | — | ⏳ 键布局与死信规则已记录（见下） |
-| 延迟队列 | `RedisDelayQueue.cs` | `queues/delay.rs` | — | ⏳ |
+| 队列 | `RedisQueue.cs` | `queues/queue.rs` | `src/queues/queue.zig` | ✅ `LPUSH`/`RPOP`/`BRPOP`，追踪字段注入，发送失败重试 |
+| 可靠队列 | `RedisReliableQueue.cs` | `queues/reliable.rs` | `src/queues/reliable.zig` | ✅ 确认/回滚/发布消费/死信/错误计数/延迟补投 |
+| 延迟队列 | `RedisDelayQueue.cs` | `queues/delay.rs` | `src/queues/delay.zig` | ✅ `ZADD` 到期分数、`ZRANGEBYSCORE`+`ZREM` 抢占、批量转移 |
 | Stream 消息队列 | `RedisStream.cs` | `queues/stream.rs` | — | ⏳ |
-| 服务层 | `Services/*`（EventBus / Stat / Deferred / RedLock） | `services.rs` | — | ⏳（RedLock 已记录算法） |
-| Tair 扩展 | `FullRedis.Ex*` | `tair.rs` | — | ⏳ |
+| 服务层 | `Services/*`（Stat / Deferred / RedLock） | `services.rs` | `src/services/{stat,deferred,redlock}.zig` | ✅ RedLock/延迟批处理/流式统计；EventBus 随 Stream 落地 |
+| Tair 扩展 | `FullRedis.Ex*` | `tair.rs` | `src/full.zig`（`Ex*`） | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
 | 拓扑 | `Clusters/*`（Cluster/Sentinel/Replication） | `cluster/*` | — | ⏳ |
 | TLS | `Ssl` / `rediss://` | rustls | — | ⏳ **当前显式报错，不降级明文** |
 | 异步 API | `*Async`（.NET） | `async_api.rs`（tokio） | — | ➖ Zig 侧不 1:1 迁移（由调用方线程模型决定） |
@@ -67,20 +67,26 @@
 - **时钟域**：`bootTicksMs()` = Windows `GetTickCount64` / POSIX `CLOCK_MONOTONIC` 毫秒，与 C# `Environment.TickCount64` 同域。
 - 证据：`tests/all.zig`「分布式锁：互斥 / 超时 / 释放后可重入」。
 
-## 五、尚未实现（下一里程碑输入）
+## 五、队列 / 服务 / Tair（已验证）
 
-1. **队列族**：键布局照 Rust README：
-   - 普通队列 `LPUSH` / `RPOP`（阻塞 `BRPOP`）；
-   - 可靠队列 `{key}`、`{key}:Ack:{ukey}`、`{key}:Status:{ukey}`（JSON PascalCase，7 天过期）、`{key}:AllStatus`（`SET NX EX RetryInterval` 抢清理权）、`{key}:Delay`（ZSet，`score = Unix 秒 + 延迟`）；
-   - 死信：`LastActive + RetryInterval * 10 < Now` 回滚确认队列。
-2. **Stream**：`__data` 基元约定、对象字段扁平化、消费组、`retry_ack`。
-3. **服务层**：`RedisEventBus` / `RedisStat` / `RedisDeferred` / `RedisRedLock`。
-4. **Tair**：`ex_set` / `ex_get` / `ex_hset` 等（需 Tair 实例）。
-5. **拓扑**：Cluster slot/hash tag/`MOVED`/`ASK`、Sentinel、Replication、`ReadFromReplicas`。
-6. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
-7. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
+- **普通队列**：`LPUSH` 生产、`RPOP`/`BRPOP` 消费；`Settings.attachTraceAlloc` 仅对 JSON 对象注入追踪字段。
+- **可靠队列键布局**：`{key}`、`{key}:Ack:{8位消费者}`、`{key}:Status:{消费者}`（PascalCase JSON，7 天）、
+  `{key}:AllStatus`（`SET NX EX RetryInterval` 抢清理权）、`{key}:Delay`（ZSet，`score = Unix 秒 + 延迟`）；
+  死信判定 `LastActive + RetryInterval * 10 < Now`；错误计数写**备份库**（`db == 15 ? 0 : db + 1`）的 `{key}:Error:{md5}`，30 天、累计 10 次丢弃。
+- **服务层**：`RedisDeferred`（`SPOP` 批处理 + 失败回写）、`RedisStat`（`RENAME` 快照 + `HGETALL` + i32 校验）、
+  `RedLock`（**普通 SET**（与 C# 一致）、`quorum = n/2+1`、漂移 1%、200ms+jitter 重试、比较令牌的 Lua 释放；释放脚本按 `FullRedis` 前缀拼完整键）。
+- **Tair**：`EXSET/EXGET`、`EXINCRBY`（返回 `[值, 版本]`）、`EXHSET/EXHGET/EXHMGET/EXHGETWITHVER/EXHINCRBY`、
+  `EXHPTTL`、`EXHKEYS/EXHVALS/EXHLEN/EXHDEL`（`EXHINCRBY` 按 Rust 取整数返回）。
+- 证据：`tests/queues_services.zig` 6 个用例（普通/延迟/可靠队列、延迟批处理、统计、RedLock、Tair）。
 
-## 六、Zig 0.17 实测坑（已规避，勿回退）
+## 六、尚未实现（下一里程碑输入）
+
+1. **Stream**：`__data` 基元约定、对象字段扁平化、消费组、`retry_ack`；随后接 `RedisEventBus`。
+2. **拓扑**：Cluster slot/hash tag/`MOVED`/`ASK`、Sentinel、Replication、`ReadFromReplicas`。
+3. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
+4. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
+
+## 七、Zig 0.17 实测坑（已规避，勿回退）
 
 1. **按值返回会悬空指针**：`resp.Reader` 原保存 `*const Stream`、`Client` 原保存 `*const ConnConfig`，
    构造函数返回值被拷贝后指针指向旧栈帧 → Windows AFD 句柄读报 `INVALID_HANDLE`。

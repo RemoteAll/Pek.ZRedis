@@ -112,6 +112,7 @@ const Entry = struct {
     set: std.ArrayList([]u8) = .empty,
     zset: std.ArrayList(ZItem) = .empty,
     expire_at_ms: i64 = 0,
+    ver: i64 = 0,
 
     fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         self.str.deinit(gpa);
@@ -663,6 +664,205 @@ fn handle(ctx: *ConnCtx, args: []const []const u8) !void {
     }
     if (eq(cmd, "HSCAN")) return hscanCmd(ctx, args);
 
+    // ── Tair 扩展（EX*，版本号按 key 记录）──
+    if (eq(cmd, "EXSET")) {
+        var previous: ?[]u8 = null;
+        if (s.get(args[1])) |prev| {
+            if (prev.kind == .string) previous = try s.gpa.dupe(u8, prev.str.items);
+        }
+        defer if (previous) |p| s.gpa.free(p);
+        const entry = try s.getOrCreate(args[1], .string);
+        if (entry.kind != .string) return ctx.err("WRONGTYPE");
+        entry.str.clearRetainingCapacity();
+        try entry.str.appendSlice(s.gpa, args[2]);
+        var i: usize = 3;
+        while (i < args.len) : (i += 1) {
+            if (eq(args[i], "EX") and i + 1 < args.len) {
+                const secs = std.fmt.parseInt(i64, args[i + 1], 10) catch 0;
+                entry.expire_at_ms = if (secs > 0) s.nowMs() + secs * 1000 else 0;
+                i += 1;
+            } else if (eq(args[i], "VER") and i + 1 < args.len) {
+                entry.ver = std.fmt.parseInt(i64, args[i + 1], 10) catch 0;
+                i += 1;
+            }
+        }
+        return ctx.bulk(previous);
+    }
+    if (eq(cmd, "EXGET")) {
+        const entry = s.get(args[1]) orelse {
+            try ctx.arrayHeader(0);
+            return;
+        };
+        if (entry.kind != .string) {
+            try ctx.arrayHeader(0);
+            return;
+        }
+        try ctx.arrayHeader(2);
+        try ctx.bulk(entry.str.items);
+        return ctx.int(entry.ver);
+    }
+    if (eq(cmd, "EXINCRBY")) {
+        const delta = std.fmt.parseInt(i64, args[2], 10) catch 0;
+        const entry = try s.getOrCreate(args[1], .string);
+        if (entry.kind != .string) return ctx.err("WRONGTYPE");
+        const current = std.fmt.parseInt(i64, entry.str.items, 10) catch 0;
+        const next = current + delta;
+        var buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}", .{next}) catch "0";
+        entry.str.clearRetainingCapacity();
+        try entry.str.appendSlice(s.gpa, text);
+        entry.ver += 1;
+        var i: usize = 3;
+        while (i < args.len) : (i += 1) {
+            if (eq(args[i], "EX") and i + 1 < args.len) {
+                const secs = std.fmt.parseInt(i64, args[i + 1], 10) catch 0;
+                entry.expire_at_ms = if (secs > 0) s.nowMs() + secs * 1000 else 0;
+                i += 1;
+            } else if (eq(args[i], "VER") and i + 1 < args.len) {
+                // VER 是「期望版本」条件；0 表示不校验
+                i += 1;
+            }
+        }
+        try ctx.arrayHeader(2);
+        try ctx.int(next);
+        return ctx.int(entry.ver);
+    }
+    if (eq(cmd, "EXHSET")) {
+        const entry = try s.getOrCreate(args[1], .hash);
+        if (entry.kind != .hash) return ctx.err("WRONGTYPE");
+        var nx = false;
+        var ver: i64 = -1;
+        var ex: i64 = 0;
+        var i: usize = 4;
+        while (i < args.len) : (i += 1) {
+            if (eq(args[i], "NX")) {
+                nx = true;
+            } else if (eq(args[i], "VER") and i + 1 < args.len) {
+                ver = std.fmt.parseInt(i64, args[i + 1], 10) catch -1;
+                i += 1;
+            } else if (eq(args[i], "EX") and i + 1 < args.len) {
+                ex = std.fmt.parseInt(i64, args[i + 1], 10) catch 0;
+                i += 1;
+            }
+        }
+        const idx = hashFind(entry, args[2]);
+        if (nx and idx != null) return ctx.int(0);
+        const copy = try s.gpa.dupe(u8, args[3]);
+        if (idx) |k| {
+            s.gpa.free(entry.hash.items[k].value);
+            entry.hash.items[k].value = copy;
+        } else {
+            try entry.hash.append(s.gpa, .{ .field = try s.gpa.dupe(u8, args[2]), .value = copy });
+        }
+        if (ver >= 0) entry.ver = ver;
+        if (ex > 0) entry.expire_at_ms = s.nowMs() + ex * 1000;
+        return ctx.int(if (idx == null) 1 else 0);
+    }
+    if (eq(cmd, "EXHGET")) {
+        const entry = s.get(args[1]) orelse return ctx.bulk(null);
+        if (entry.kind != .hash) return ctx.bulk(null);
+        const idx = hashFind(entry, args[2]) orelse return ctx.bulk(null);
+        return ctx.bulk(entry.hash.items[idx].value);
+    }
+    if (eq(cmd, "EXHMGET")) {
+        try ctx.arrayHeader(args.len - 2);
+        const entry = s.get(args[1]);
+        for (args[2..]) |field| {
+            if (entry) |e| {
+                if (e.kind == .hash) {
+                    if (hashFind(e, field)) |idx| {
+                        try ctx.bulk(e.hash.items[idx].value);
+                        continue;
+                    }
+                }
+            }
+            try ctx.bulk(null);
+        }
+        return;
+    }
+    if (eq(cmd, "EXHGETWITHVER")) {
+        const entry = s.get(args[1]) orelse {
+            try ctx.arrayHeader(0);
+            return;
+        };
+        if (entry.kind != .hash) {
+            try ctx.arrayHeader(0);
+            return;
+        }
+        const idx = hashFind(entry, args[2]) orelse {
+            try ctx.arrayHeader(0);
+            return;
+        };
+        try ctx.arrayHeader(2);
+        try ctx.bulk(entry.hash.items[idx].value);
+        return ctx.int(entry.ver);
+    }
+    if (eq(cmd, "EXHINCRBY")) {
+        const delta = std.fmt.parseInt(i64, args[3], 10) catch 0;
+        const entry = try s.getOrCreate(args[1], .hash);
+        if (entry.kind != .hash) return ctx.err("WRONGTYPE");
+        const idx = hashFind(entry, args[2]);
+        const current: i64 = if (idx) |k| (std.fmt.parseInt(i64, entry.hash.items[k].value, 10) catch 0) else 0;
+        const next = current + delta;
+        var buf: [32]u8 = undefined;
+        const text = try s.gpa.dupe(u8, std.fmt.bufPrint(&buf, "{d}", .{next}) catch "0");
+        if (idx) |k| {
+            s.gpa.free(entry.hash.items[k].value);
+            entry.hash.items[k].value = text;
+        } else {
+            try entry.hash.append(s.gpa, .{ .field = try s.gpa.dupe(u8, args[2]), .value = text });
+        }
+        entry.ver += 1;
+        var i: usize = 4;
+        while (i < args.len) : (i += 1) {
+            if (eq(args[i], "EX") and i + 1 < args.len) {
+                const secs = std.fmt.parseInt(i64, args[i + 1], 10) catch 0;
+                entry.expire_at_ms = if (secs > 0) s.nowMs() + secs * 1000 else 0;
+                i += 1;
+            }
+        }
+        return ctx.int(next);
+    }
+    if (eq(cmd, "EXHPTTL")) {
+        const entry = s.get(args[1]) orelse return ctx.int(-2);
+        if (entry.kind != .hash or hashFind(entry, args[2]) == null) return ctx.int(-2);
+        if (entry.expire_at_ms == 0) return ctx.int(-1);
+        const remain = entry.expire_at_ms - s.nowMs();
+        return ctx.int(if (remain > 0) remain else -2);
+    }
+    if (eq(cmd, "EXHKEYS") or eq(cmd, "EXHVALS")) {
+        const entry = s.get(args[1]) orelse {
+            try ctx.arrayHeader(0);
+            return;
+        };
+        if (entry.kind != .hash) {
+            try ctx.arrayHeader(0);
+            return;
+        }
+        try ctx.arrayHeader(entry.hash.items.len);
+        for (entry.hash.items) |p| try ctx.bulk(if (eq(cmd, "EXHKEYS")) p.field else p.value);
+        return;
+    }
+    if (eq(cmd, "EXHLEN")) {
+        const entry = s.get(args[1]) orelse return ctx.int(0);
+        if (entry.kind != .hash) return ctx.int(0);
+        return ctx.int(@intCast(entry.hash.items.len));
+    }
+    if (eq(cmd, "EXHDEL")) {
+        const entry = s.get(args[1]) orelse return ctx.int(0);
+        if (entry.kind != .hash) return ctx.int(0);
+        var n: i64 = 0;
+        for (args[2..]) |field| {
+            if (hashFind(entry, field)) |idx| {
+                const removed = entry.hash.orderedRemove(idx);
+                s.gpa.free(removed.field);
+                s.gpa.free(removed.value);
+                n += 1;
+            }
+        }
+        return ctx.int(n);
+    }
+
     // ── 列表 ──
     if (eq(cmd, "LPUSH") or eq(cmd, "RPUSH")) {
         const entry = try s.getOrCreate(args[1], .list);
@@ -677,6 +877,18 @@ fn handle(ctx: *ConnCtx, args: []const []const u8) !void {
         if (entry.kind != .list or entry.list.items.len == 0) return ctx.bulk(null);
         const item = if (eq(cmd, "LPOP")) entry.list.orderedRemove(0) else entry.list.pop().?;
         defer s.gpa.free(item);
+        return ctx.bulk(item);
+    }
+    if (eq(cmd, "RPOPLPUSH") or eq(cmd, "BRPOPLPUSH")) {
+        const src = s.get(args[1]) orelse return ctx.bulk(null);
+        if (src.kind != .list or src.list.items.len == 0) return ctx.bulk(null);
+        const item = src.list.pop().?;
+        const dst = try s.getOrCreate(args[2], .list);
+        if (dst.kind != .list) {
+            s.gpa.free(item);
+            return ctx.err("WRONGTYPE");
+        }
+        try dst.list.insert(s.gpa, 0, item);
         return ctx.bulk(item);
     }
     if (eq(cmd, "BLPOP") or eq(cmd, "BRPOP")) {
@@ -1088,7 +1300,22 @@ fn handle(ctx: *ConnCtx, args: []const []const u8) !void {
         if (args.len > 1 and eq(args[1], "EXISTS")) return ctx.int(1);
         return ctx.simple("OK");
     }
-    if (eq(cmd, "EVAL") or eq(cmd, "EVALSHA")) return ctx.int(1);
+    if (eq(cmd, "EVAL") or eq(cmd, "EVALSHA")) {
+        // 最小实现：RedLock 解锁脚本（GET 比较后 DEL）
+        // 参数：[EVAL, script, numkeys, key, argv1]
+        if (args.len >= 5 and std.mem.indexOf(u8, args[1], "redis.call('del'") != null) {
+            const key = args[3];
+            const expect = args[4];
+            if (s.get(key)) |entry| {
+                if (entry.kind == .string and std.mem.eql(u8, entry.str.items, expect)) {
+                    s.removeLocked(key);
+                    return ctx.int(1);
+                }
+            }
+            return ctx.int(0);
+        }
+        return ctx.int(1);
+    }
     if (eq(cmd, "OBJECT")) return ctx.bulk(null);
     if (eq(cmd, "MEMORY")) return ctx.bulk(null);
     if (eq(cmd, "FLUSHALL")) return ctx.simple("OK");

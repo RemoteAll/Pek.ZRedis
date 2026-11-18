@@ -17,9 +17,9 @@
 [CmdletBinding()]
 param(
     # 单元测试基线（新增用例后必须同步抬高）
-    [int]$MinUnit = 27,
+    [int]$MinUnit = 36,
     # 集成测试基线（新增用例后必须同步抬高）
-    [int]$MinIntegration = 9
+    [int]$MinIntegration = 17
 )
 
 $ErrorActionPreference = 'Stop'
