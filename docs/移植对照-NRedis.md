@@ -32,7 +32,7 @@
 | Stream 消息队列 | `RedisStream.cs` | `queues/stream.rs` | `src/queues/stream.zig` | ✅ 基元/对象字段展开、消费组、确认/挂起/抢夺、死信、裁剪与区间读 |
 | 服务层 | `Services/*`（Stat / Deferred / RedLock / EventBus） | `services.rs` | `src/services/{stat,deferred,redlock,eventbus}.zig` | ✅ RedLock/延迟批处理/流式统计/事件总线 |
 | Tair 扩展 | `FullRedis.Ex*` | `tair.rs` | `src/full.zig`（`Ex*`） | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
-| 拓扑 | `Clusters/*`（Cluster/Sentinel/Replication） | `cluster/*` | — | ⏳ |
+| 拓扑 | `Clusters/*`（Cluster/Sentinel/Replication） | `cluster/*` | `src/cluster.zig` + `src/topology_discovery.zig` | ✅ 槽位/节点解析/选路/重定向/健康退避/INFO 发现；自动刷新 ⏳ |
 | TLS | `Ssl` / `rediss://` | rustls | — | ⏳ **当前显式报错，不降级明文** |
 | 异步 API | `*Async`（.NET） | `async_api.rs`（tokio） | — | ➖ Zig 侧不 1:1 迁移（由调用方线程模型决定） |
 | ASP.NET 集成 | `RedisCacheProvider` / `CacheExtensions` | 不迁移 | — | ➖ .NET 宿主专属 |
@@ -91,9 +91,23 @@
   处理成功才 `XACK`；失败保持挂起等 `retry_ack` 抢回。
 - 证据：`tests/stream.zig` 4 个用例（基础写入/读取/裁剪/删除、消费组、独立消费+抢夺、EventBus）。
 
+### 五之三、拓扑（已验证部分）
+
+- **哈希槽**：CRC16-XMODEM + `{hash tag}`（空 tag 取整 key）；实测 `foo=12182`、`bar=5061`、`{user1000}.following=3443`。
+- **节点模型**：`CLUSTER NODES` 单行解析（`@` 后缀、flags、master-id、槽位区间、`[slot->node]` 迁移）；
+  `fail`/`fail?` 置 `link_up=false`，`slave`/`replica` 置 `is_replica`。
+- **选路**：写优先主库；读可按 `ReadFromReplicas` 选从；失败按 1s/2s/4s…（上限 64s）退避后重选；
+  `MOVED` 记入槽位覆盖，`ASK` 不记（临时跳转）。
+- **执行侧**：`Redis.executeOnEndpoint`（按端点惰性建池）与 `Redis.executeOnKey`
+  （选路 → 执行 → `MOVED`/`ASK` 跟进 + `ASKING` → 失败重选，最多 8 跳）。
+- **发现**：`parseInfo` + `detectMode`（cluster / sentinel / replication）+ `parseDiscovery`
+  （`master_host:port`、`slaveN`、`masterN` 地址）+ `buildReplicationNodes`。
+- 证据：`src/cluster.zig` 5 个单元用例、`src/topology_discovery.zig` 2 个单元用例、`tests/cluster.zig` 1 个集成用例。
+
 ## 六、尚未实现（下一里程碑输入）
 
-1. **拓扑**：Cluster slot/hash tag/`MOVED`/`ASK`、Sentinel、Replication、`ReadFromReplicas`。
+1. **拓扑自动化**：由 `INFO`/`CLUSTER NODES`/`INFO Sentinel` 实际拉取并定时刷新（当前只提供纯解析与执行时选路）；
+   `FullRedis` 各结构体命令的自动选路仍留给调用方用 `executeOnKey`。
 2. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
 3. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
 

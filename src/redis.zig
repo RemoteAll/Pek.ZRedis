@@ -12,6 +12,7 @@ const encoder = @import("encoder.zig");
 const options = @import("options.zig");
 const client = @import("client.zig");
 const pool = @import("pool.zig");
+const cluster = @import("cluster.zig");
 
 pub const Error = client.Error;
 
@@ -44,11 +45,35 @@ pub const InfoMap = struct {
     }
 };
 
+/// 解析 `INFO` 文本（`# Section` 行忽略，`key:value` 取首个冒号）。
+pub fn parseInfo(gpa: std.mem.Allocator, text: []const u8) !InfoMap {
+    var out = InfoMap{ .gpa = gpa };
+    errdefer out.deinit();
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const idx = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..idx], " \t\r");
+        const value = std.mem.trim(u8, line[idx + 1 ..], " \t\r");
+        if (key.len == 0) continue;
+        const gop = try out.map.getOrPut(gpa, key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try gpa.dupe(u8, key);
+            gop.value_ptr.* = try gpa.dupe(u8, value);
+        }
+    }
+    return out;
+}
+
 pub const Redis = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     opts: options.Options,
     conn_pool: pool.Pool,
+    /// 拓扑模式下按端点惰性创建的连接池（仅 `executeOnEndpoint` / `executeOnKey` 使用）
+    ep_pools: std.StringHashMapUnmanaged(*pool.Pool) = .empty,
     commands: std.atomic.Value(u64) = .init(0),
     errors: std.atomic.Value(u64) = .init(0),
     diag: client.Diag = .{},
@@ -79,6 +104,13 @@ pub const Redis = struct {
     }
 
     pub fn deinit(self: *Redis) void {
+        var it = self.ep_pools.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.gpa.destroy(entry.value_ptr.*);
+            self.gpa.free(entry.key_ptr.*);
+        }
+        self.ep_pools.deinit(self.gpa);
         self.conn_pool.deinit();
         self.opts.deinit();
     }
@@ -126,14 +158,28 @@ pub const Redis = struct {
     }
 
     fn executeInner(self: *Redis, args: []const []const u8, block: ?i64) Error!resp.Value {
+        return self.executeInnerPool(&self.conn_pool, null, args, block);
+    }
+
+    fn executeInnerPool(
+        self: *Redis,
+        p: *pool.Pool,
+        endpoint: ?[]const u8,
+        args: []const []const u8,
+        block: ?i64,
+    ) Error!resp.Value {
         const attempts = @max(self.opts.retry, 1);
         var last: Error = error.IoError;
 
         var attempt: usize = 0;
         while (attempt < attempts) : (attempt += 1) {
-            var lease = self.conn_pool.acquire() catch |e| {
+            var lease = p.acquire() catch |e| {
                 _ = self.errors.fetchAdd(1, .monotonic);
-                self.setDiag("借出连接失败（{s}）：{s}", .{ self.conn_pool.lastError(), @errorName(e) });
+                if (endpoint) |ep| {
+                    self.setDiag("借出连接失败（{s}）：{s}（{s}）", .{ ep, p.lastError(), @errorName(e) });
+                } else {
+                    self.setDiag("借出连接失败（{s}）：{s}", .{ p.lastError(), @errorName(e) });
+                }
                 return e;
             };
             const c = lease.get();
@@ -167,6 +213,100 @@ pub const Redis = struct {
 
         _ = self.errors.fetchAdd(1, .monotonic);
         return last;
+    }
+
+    // ───────────────────────── 拓扑路由 ─────────────────────────
+
+    /// 取（或惰性创建）指定端点的连接池；参数沿用当前选项，仅替换端点。
+    fn poolFor(self: *Redis, endpoint: []const u8) Error!*pool.Pool {
+        if (self.ep_pools.get(endpoint)) |p| return p;
+
+        var cfg = client.ConnConfig.initFromOptions(self.gpa, &self.opts, 0) catch return error.OutOfMemory;
+        self.gpa.free(cfg.endpoint);
+        cfg.endpoint = self.gpa.dupe(u8, endpoint) catch return error.OutOfMemory;
+
+        const p = self.gpa.create(pool.Pool) catch return error.OutOfMemory;
+        p.* = pool.Pool.init(self.gpa, self.io, cfg, self.opts.pool);
+        const key = self.gpa.dupe(u8, endpoint) catch {
+            p.deinit();
+            self.gpa.destroy(p);
+            return error.OutOfMemory;
+        };
+        self.ep_pools.put(self.gpa, key, p) catch {
+            self.gpa.free(key);
+            p.deinit();
+            self.gpa.destroy(p);
+            return error.OutOfMemory;
+        };
+        return p;
+    }
+
+    /// 在指定端点上执行（集群/主从路由与对拍用）。
+    pub fn executeOnEndpoint(self: *Redis, endpoint: []const u8, args: []const []const u8) Error!resp.Value {
+        const p = try self.poolFor(endpoint);
+        return self.executeInnerPool(p, endpoint, args, null);
+    }
+
+    /// 按拓扑选节点执行；自动处理 `MOVED`（记忆覆盖）与 `ASK`（先发 `ASKING`），
+    /// 连接类失败后按拓扑重选节点。
+    pub fn executeOnKey(
+        self: *Redis,
+        topology: *cluster.Topology,
+        key: []const u8,
+        write: bool,
+        args: []const []const u8,
+    ) Error!resp.Value {
+        var route = topology.selectRoute(key, write) orelse {
+            self.setDiag("拓扑为空，无法路由 key={s}", .{key});
+            return error.Config;
+        };
+        var asking = false;
+        var owned_endpoint: ?[]u8 = null;
+        defer if (owned_endpoint) |e| self.gpa.free(e);
+
+        var hops: usize = 0;
+        while (hops < 8) : (hops += 1) {
+            if (asking) {
+                var ask = self.executeOnEndpoint(route.endpoint, &.{"ASKING"}) catch |e| {
+                    self.setDiag("ASKING 失败（{s}）：{s}", .{ route.endpoint, @errorName(e) });
+                    return e;
+                };
+                ask.deinit(self.gpa);
+            }
+
+            if (self.executeOnEndpoint(route.endpoint, args)) |value| {
+                topology.resetNode(route.endpoint);
+                return value;
+            } else |err| {
+                if (err == error.Server) {
+                    if (try cluster.parseRedirect(self.gpa, self.lastError())) |r0| {
+                        var redirect = r0;
+                        defer redirect.deinit(self.gpa);
+                        topology.rememberRedirect(redirect.slot, redirect.endpoint, redirect.kind == .moved);
+                        if (owned_endpoint) |e| self.gpa.free(e);
+                        owned_endpoint = try self.gpa.dupe(u8, redirect.endpoint);
+                        route = .{
+                            .endpoint = owned_endpoint.?,
+                            .slot = redirect.slot,
+                            .node_index = null,
+                        };
+                        asking = redirect.kind == .ask;
+                        continue;
+                    }
+                    return err;
+                }
+
+                const failed = route.endpoint;
+                route = topology.reselectRoute(key, write, failed) orelse {
+                    self.setDiag("节点 {s} 失败且无可用替代（key={s}）：{s}", .{ failed, key, @errorName(err) });
+                    return err;
+                };
+                asking = false;
+            }
+        }
+
+        self.setDiag("重定向次数超限（>{d}）：key={s}", .{ hops, key });
+        return error.Server;
     }
 
     /// 管道执行（一次性写入、顺序读回）。
@@ -696,26 +836,7 @@ pub const Redis = struct {
     pub fn info(self: *Redis) Error!InfoMap {
         var v = try self.execute(&.{"INFO"});
         defer v.deinit(self.gpa);
-        const text = v.asString() orelse "";
-
-        var out = InfoMap{ .gpa = self.gpa };
-        errdefer out.deinit();
-
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |raw| {
-            const line = std.mem.trim(u8, raw, " \t\r");
-            if (line.len == 0 or line[0] == '#') continue;
-            const idx = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            const key = std.mem.trim(u8, line[0..idx], " \t\r");
-            const value = std.mem.trim(u8, line[idx + 1 ..], " \t\r");
-            if (key.len == 0) continue;
-            const gop = try out.map.getOrPut(self.gpa, key);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try self.gpa.dupe(u8, key);
-                gop.value_ptr.* = try self.gpa.dupe(u8, value);
-            }
-        }
-        return out;
+        return parseInfo(self.gpa, v.asString() orelse "");
     }
 
     pub fn version(self: *Redis) Error!?[]u8 {
