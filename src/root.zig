@@ -43,12 +43,14 @@ pub const queues = struct {
     pub const queue = @import("queues/queue.zig");
     pub const delay = @import("queues/delay.zig");
     pub const reliable = @import("queues/reliable.zig");
+    pub const stream = @import("queues/stream.zig");
 };
 
 pub const services = struct {
     pub const redlock = @import("services/redlock.zig");
     pub const deferred = @import("services/deferred.zig");
     pub const stat = @import("services/stat.zig");
+    pub const eventbus = @import("services/eventbus.zig");
 };
 
 pub const Redis = redis.Redis;
@@ -64,10 +66,13 @@ pub const PubSub = pubsub.PubSub;
 pub const RedisQueue = queues.queue.RedisQueue;
 pub const RedisDelayQueue = queues.delay.RedisDelayQueue;
 pub const RedisReliableQueue = queues.reliable.RedisReliableQueue;
+pub const RedisStream = queues.stream.RedisStream;
+pub const StreamMessage = queues.stream.Message;
 pub const QueueSettings = queues.base.Settings;
 pub const QueueStatus = queues.status.QueueStatus;
 pub const RedisDeferred = services.deferred.RedisDeferred;
 pub const RedisStat = services.stat.RedisStat;
+pub const RedisEventBus = services.eventbus.RedisEventBus;
 pub const RedLock = services.redlock.RedLock;
 pub const acquireRedLock = services.redlock.acquireRedLock;
 pub const Client = client.Client;

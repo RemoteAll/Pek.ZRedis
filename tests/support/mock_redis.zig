@@ -101,8 +101,18 @@ pub const MockServer = struct {
 
 const HPair = struct { field: []u8, value: []u8 };
 const ZItem = struct { member: []u8, score: f64 };
+const StreamEntry = struct { id: []u8, fields: [][]u8 };
+const StreamPending = struct { id: []u8, consumer: []u8, delivery: i64, last_ms: i64 };
+const StreamConsumer = struct { name: []u8, seen_ms: i64 };
+const StreamGroup = struct {
+    name: []u8,
+    last_ms: u64,
+    last_seq: u64,
+    consumers: std.ArrayList(StreamConsumer) = .empty,
+    pending: std.ArrayList(StreamPending) = .empty,
+};
 
-const Kind = enum { string, list, hash, set, zset };
+const Kind = enum { string, list, hash, set, zset, stream };
 
 const Entry = struct {
     kind: Kind,
@@ -111,6 +121,11 @@ const Entry = struct {
     hash: std.ArrayList(HPair) = .empty,
     set: std.ArrayList([]u8) = .empty,
     zset: std.ArrayList(ZItem) = .empty,
+    entries: std.ArrayList(StreamEntry) = .empty,
+    groups: std.ArrayList(StreamGroup) = .empty,
+    last_ms: u64 = 0,
+    last_seq: u64 = 0,
+    entries_added: i64 = 0,
     expire_at_ms: i64 = 0,
     ver: i64 = 0,
 
@@ -127,6 +142,23 @@ const Entry = struct {
         self.set.deinit(gpa);
         for (self.zset.items) |z| gpa.free(z.member);
         self.zset.deinit(gpa);
+        for (self.entries.items) |e| {
+            gpa.free(e.id);
+            for (e.fields) |f| gpa.free(f);
+            if (e.fields.len > 0) gpa.free(e.fields);
+        }
+        self.entries.deinit(gpa);
+        for (self.groups.items) |*g| {
+            gpa.free(g.name);
+            for (g.consumers.items) |c| gpa.free(c.name);
+            g.consumers.deinit(gpa);
+            for (g.pending.items) |p| {
+                gpa.free(p.id);
+                gpa.free(p.consumer);
+            }
+            g.pending.deinit(gpa);
+        }
+        self.groups.deinit(gpa);
     }
 
     fn clearValues(self: *Entry, gpa: std.mem.Allocator, kind: Kind) void {
@@ -433,6 +465,7 @@ fn handle(ctx: *ConnCtx, args: []const []const u8) !void {
             .hash => "hash",
             .set => "set",
             .zset => "zset",
+            .stream => "stream",
         });
     }
     if (eq(cmd, "TTL") or eq(cmd, "PTTL")) {
@@ -1316,6 +1349,494 @@ fn handle(ctx: *ConnCtx, args: []const []const u8) !void {
         }
         return ctx.int(1);
     }
+    // ── Stream ──
+    if (eq(cmd, "XADD")) {
+        const entry = try s.getOrCreate(args[1], .stream);
+        if (entry.kind != .stream) return ctx.err("WRONGTYPE");
+        var i: usize = 2;
+        var trim_max: ?usize = null;
+        if (i < args.len and eq(args[i], "MAXLEN")) {
+            i += 1;
+            if (i < args.len and eq(args[i], "~")) i += 1;
+            if (i < args.len) {
+                trim_max = @intCast(std.fmt.parseInt(i64, args[i], 10) catch 0);
+                i += 1;
+            }
+        }
+        if (i >= args.len) return ctx.err("ERR wrong number of arguments");
+        const id_arg = args[i];
+        i += 1;
+
+        var ms: u64 = 0;
+        var seq: u64 = 0;
+        if (eq(id_arg, "*")) {
+            ms = @intCast(s.nowMs());
+            seq = if (entry.last_ms == ms) entry.last_seq + 1 else 0;
+        } else {
+            const parsed = parseStreamId(id_arg) orelse return ctx.err("ERR Invalid stream ID");
+            ms = parsed.ms;
+            seq = parsed.seq;
+        }
+        entry.last_ms = ms;
+        entry.last_seq = seq;
+        entry.entries_added += 1;
+
+        const id_text = try std.fmt.allocPrint(s.gpa, "{d}-{d}", .{ ms, seq });
+        var fields = try s.gpa.alloc([]u8, args.len - i);
+        var filled: usize = 0;
+        errdefer {
+            for (fields[0..filled]) |f| s.gpa.free(f);
+            s.gpa.free(fields);
+        }
+        while (i < args.len) : (i += 1) {
+            fields[filled] = try s.gpa.dupe(u8, args[i]);
+            filled += 1;
+        }
+        try entry.entries.append(s.gpa, .{ .id = id_text, .fields = fields });
+
+        if (trim_max) |max| {
+            while (entry.entries.items.len > max) {
+                const removed = entry.entries.orderedRemove(0);
+                s.gpa.free(removed.id);
+                for (removed.fields) |f| s.gpa.free(f);
+                if (removed.fields.len > 0) s.gpa.free(removed.fields);
+            }
+        }
+        return ctx.bulk(id_text);
+    }
+    if (eq(cmd, "XLEN")) {
+        const entry = s.get(args[1]) orelse return ctx.int(0);
+        if (entry.kind != .stream) return ctx.int(0);
+        return ctx.int(@intCast(entry.entries.items.len));
+    }
+    if (eq(cmd, "XDEL")) {
+        const entry = s.get(args[1]) orelse return ctx.int(0);
+        if (entry.kind != .stream) return ctx.int(0);
+        var n: i64 = 0;
+        for (args[2..]) |id| {
+            var k: usize = 0;
+            while (k < entry.entries.items.len) : (k += 1) {
+                if (std.mem.eql(u8, entry.entries.items[k].id, id)) {
+                    const removed = entry.entries.orderedRemove(k);
+                    s.gpa.free(removed.id);
+                    for (removed.fields) |f| s.gpa.free(f);
+                    if (removed.fields.len > 0) s.gpa.free(removed.fields);
+                    n += 1;
+                    break;
+                }
+            }
+        }
+        return ctx.int(n);
+    }
+    if (eq(cmd, "XTRIM")) {
+        const entry = s.get(args[1]) orelse return ctx.int(0);
+        if (entry.kind != .stream) return ctx.int(0);
+        if (args.len >= 4 and eq(args[2], "MAXLEN")) {
+            var idx: usize = 3;
+            if (eq(args[idx], "~")) idx += 1;
+            const max: usize = @intCast(std.fmt.parseInt(i64, args[idx], 10) catch 0);
+            var n: i64 = 0;
+            while (entry.entries.items.len > max) {
+                const removed = entry.entries.orderedRemove(0);
+                s.gpa.free(removed.id);
+                for (removed.fields) |f| s.gpa.free(f);
+                if (removed.fields.len > 0) s.gpa.free(removed.fields);
+                n += 1;
+            }
+            return ctx.int(n);
+        }
+        if (args.len >= 4 and eq(args[2], "MINID")) {
+            const min = parseStreamId(args[3]) orelse return ctx.int(0);
+            var n: i64 = 0;
+            while (entry.entries.items.len > 0) {
+                const first = entry.entries.items[0];
+                const fid = parseStreamId(first.id) orelse break;
+                if (streamOrder(fid.ms, fid.seq, min.ms, min.seq) != .lt) break;
+                const removed = entry.entries.orderedRemove(0);
+                s.gpa.free(removed.id);
+                for (removed.fields) |f| s.gpa.free(f);
+                if (removed.fields.len > 0) s.gpa.free(removed.fields);
+                n += 1;
+            }
+            return ctx.int(n);
+        }
+        return ctx.int(0);
+    }
+    if (eq(cmd, "XRANGE")) {
+        const entry = s.get(args[1]) orelse {
+            try ctx.arrayHeader(0);
+            return;
+        };
+        if (entry.kind != .stream) {
+            try ctx.arrayHeader(0);
+            return;
+        }
+        const start = parseStreamRange(args[2], true);
+        const end = parseStreamRange(args[3], false);
+        var limit: usize = std.math.maxInt(usize);
+        var i: usize = 4;
+        while (i + 1 < args.len) : (i += 1) {
+            if (eq(args[i], "COUNT")) {
+                limit = @intCast(std.fmt.parseInt(i64, args[i + 1], 10) catch 0);
+                break;
+            }
+        }
+        var count: usize = 0;
+        for (entry.entries.items) |e| {
+            const id = parseStreamId(e.id) orelse continue;
+            if (!streamInRange(id.ms, id.seq, start, end)) continue;
+            if (count >= limit) break;
+            count += 1;
+        }
+        try ctx.arrayHeader(count);
+        var emitted: usize = 0;
+        for (entry.entries.items) |*e| {
+            const id = parseStreamId(e.id) orelse continue;
+            if (!streamInRange(id.ms, id.seq, start, end)) continue;
+            if (emitted >= count) break;
+            try streamEntryOut(ctx, e);
+            emitted += 1;
+        }
+        return;
+    }
+    if (eq(cmd, "XREAD") or eq(cmd, "XREADGROUP")) {
+        const is_group = eq(cmd, "XREADGROUP");
+        var i: usize = 1;
+        var group: ?[]const u8 = null;
+        var consumer: ?[]const u8 = null;
+        var count: usize = std.math.maxInt(usize);
+        if (is_group) {
+            if (!eq(args[i], "GROUP")) return ctx.err("ERR syntax error");
+            group = args[i + 1];
+            consumer = args[i + 2];
+            i += 3;
+        }
+        while (i < args.len) : (i += 1) {
+            if (eq(args[i], "BLOCK")) {
+                i += 1;
+            } else if (eq(args[i], "COUNT")) {
+                count = @intCast(std.fmt.parseInt(i64, args[i + 1], 10) catch 0);
+                i += 1;
+            } else if (eq(args[i], "STREAMS")) {
+                break;
+            }
+        }
+        if (i + 2 >= args.len) return ctx.err("ERR syntax error");
+        const key = args[i + 1];
+        const start_arg = args[i + 2];
+
+        if (!is_group) {
+            return xreadOut(ctx, s, key, start_arg, count, null);
+        }
+        return xreadGroupOut(ctx, s, key, group.?, consumer.?, start_arg, count);
+    }
+    if (eq(cmd, "XACK")) {
+        const entry = s.get(args[1]) orelse return ctx.int(0);
+        if (entry.kind != .stream) return ctx.int(0);
+        const g = findGroup(entry, args[2]) orelse return ctx.int(0);
+        var n: i64 = 0;
+        for (args[3..]) |id| {
+            var k: usize = 0;
+            while (k < g.pending.items.len) : (k += 1) {
+                if (std.mem.eql(u8, g.pending.items[k].id, id)) {
+                    const removed = g.pending.orderedRemove(k);
+                    s.gpa.free(removed.id);
+                    s.gpa.free(removed.consumer);
+                    n += 1;
+                    break;
+                }
+            }
+        }
+        return ctx.int(n);
+    }
+    if (eq(cmd, "XPENDING")) {
+        const entry = s.get(args[1]) orelse {
+            try ctx.arrayHeader(0);
+            return;
+        };
+        if (entry.kind != .stream) {
+            try ctx.arrayHeader(0);
+            return;
+        }
+        const g = findGroup(entry, args[2]) orelse return ctx.err("NOGROUP No such group");
+        if (args.len == 3) {
+            // 汇总：count / min / max / 各消费者计数
+            var min_id: ?[]const u8 = null;
+            var max_id: ?[]const u8 = null;
+            var names: std.ArrayList([]const u8) = .empty;
+            var counts: std.ArrayList(i64) = .empty;
+            defer names.deinit(s.gpa);
+            defer counts.deinit(s.gpa);
+            for (g.pending.items) |p| {
+                if (min_id == null) min_id = p.id;
+                max_id = p.id;
+                var found = false;
+                for (names.items, 0..) |name, idx| {
+                    if (std.mem.eql(u8, name, p.consumer)) {
+                        counts.items[idx] += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    try names.append(s.gpa, p.consumer);
+                    try counts.append(s.gpa, 1);
+                }
+            }
+            try ctx.arrayHeader(4);
+            try ctx.int(@intCast(g.pending.items.len));
+            try ctx.bulk(min_id);
+            try ctx.bulk(max_id);
+            try ctx.arrayHeader(names.items.len);
+            for (names.items, 0..) |name, idx| {
+                try ctx.arrayHeader(2);
+                try ctx.bulk(name);
+                try ctx.int(counts.items[idx]);
+            }
+            return;
+        }
+        // 明细
+        var limit: usize = std.math.maxInt(usize);
+        if (args.len >= 6) limit = @intCast(std.fmt.parseInt(i64, args[5], 10) catch 0);
+        const start = parseStreamRange(args[3], true);
+        const end = parseStreamRange(args[4], false);
+        var count: usize = 0;
+        for (g.pending.items) |p| {
+            const id = parseStreamId(p.id) orelse continue;
+            if (!streamInRange(id.ms, id.seq, start, end)) continue;
+            if (count >= limit) break;
+            count += 1;
+        }
+        try ctx.arrayHeader(count);
+        var emitted: usize = 0;
+        for (g.pending.items) |p| {
+            const id = parseStreamId(p.id) orelse continue;
+            if (!streamInRange(id.ms, id.seq, start, end)) continue;
+            if (emitted >= count) break;
+            try ctx.arrayHeader(4);
+            try ctx.bulk(p.id);
+            try ctx.bulk(p.consumer);
+            try ctx.int(s.nowMs() - p.last_ms);
+            try ctx.int(p.delivery);
+            emitted += 1;
+        }
+        return;
+    }
+    if (eq(cmd, "XCLAIM")) {
+        const entry = s.get(args[1]) orelse {
+            try ctx.arrayHeader(0);
+            return;
+        };
+        if (entry.kind != .stream) {
+            try ctx.arrayHeader(0);
+            return;
+        }
+        const g = findGroup(entry, args[2]) orelse return ctx.err("NOGROUP No such group");
+        const consumer = args[3];
+        const min_idle = std.fmt.parseInt(i64, args[4], 10) catch 0;
+        var claimed: usize = 0;
+        for (g.pending.items) |*p| {
+            if (claimed >= args.len - 5) break;
+            var matched = false;
+            for (args[5..]) |id| {
+                if (std.mem.eql(u8, p.id, id)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            if (s.nowMs() - p.last_ms < min_idle) continue;
+            s.gpa.free(p.consumer);
+            p.consumer = try s.gpa.dupe(u8, consumer);
+            p.delivery += 1;
+            p.last_ms = s.nowMs();
+            claimed += 1;
+        }
+        try ctx.arrayHeader(claimed);
+        var emitted: usize = 0;
+        for (g.pending.items) |p| {
+            if (emitted >= claimed) break;
+            if (!std.mem.eql(u8, p.consumer, consumer)) continue;
+            for (entry.entries.items) |*e| {
+                if (std.mem.eql(u8, e.id, p.id)) {
+                    try streamEntryOut(ctx, e);
+                    emitted += 1;
+                    break;
+                }
+            }
+        }
+        return;
+    }
+    if (eq(cmd, "XGROUP")) {
+        if (args.len < 2) return ctx.err("ERR syntax error");
+        const sub = args[1];
+        if (eq(sub, "CREATE")) {
+            if (args.len < 5) return ctx.err("ERR syntax error");
+            const entry = try s.getOrCreate(args[2], .stream);
+            if (entry.kind != .stream) return ctx.err("WRONGTYPE");
+            if (findGroup(entry, args[3]) != null) return ctx.err("BUSYGROUP Consumer Group name already exists");
+            const start = if (eq(args[4], "$"))
+                IdPair{ .ms = entry.last_ms, .seq = entry.last_seq }
+            else
+                (parseStreamId(args[4]) orelse IdPair{ .ms = 0, .seq = 0 });
+            var group = StreamGroup{ .name = try s.gpa.dupe(u8, args[3]), .last_ms = start.ms, .last_seq = start.seq };
+            errdefer {
+                s.gpa.free(group.name);
+                group.consumers.deinit(s.gpa);
+                group.pending.deinit(s.gpa);
+            }
+            try entry.groups.append(s.gpa, group);
+            return ctx.simple("OK");
+        }
+        if (eq(sub, "DESTROY")) {
+            const entry = s.get(args[2]) orelse return ctx.int(0);
+            if (entry.kind != .stream) return ctx.int(0);
+            var k: usize = 0;
+            while (k < entry.groups.items.len) : (k += 1) {
+                if (std.mem.eql(u8, entry.groups.items[k].name, args[3])) {
+                    var removed = entry.groups.orderedRemove(k);
+                    s.gpa.free(removed.name);
+                    for (removed.consumers.items) |c| s.gpa.free(c.name);
+                    removed.consumers.deinit(s.gpa);
+                    for (removed.pending.items) |p| {
+                        s.gpa.free(p.id);
+                        s.gpa.free(p.consumer);
+                    }
+                    removed.pending.deinit(s.gpa);
+                    return ctx.int(1);
+                }
+            }
+            return ctx.int(0);
+        }
+        if (eq(sub, "DELCONSUMER")) {
+            const entry = s.get(args[2]) orelse return ctx.int(0);
+            if (entry.kind != .stream) return ctx.int(0);
+            const g = findGroup(entry, args[3]) orelse return ctx.err("NOGROUP No such group");
+            var k: usize = 0;
+            while (k < g.consumers.items.len) : (k += 1) {
+                if (std.mem.eql(u8, g.consumers.items[k].name, args[4])) {
+                    s.gpa.free(g.consumers.items[k].name);
+                    _ = g.consumers.orderedRemove(k);
+                    break;
+                }
+            }
+            var removed_count: i64 = 0;
+            k = 0;
+            while (k < g.pending.items.len) {
+                if (std.mem.eql(u8, g.pending.items[k].consumer, args[4])) {
+                    const removed = g.pending.orderedRemove(k);
+                    s.gpa.free(removed.id);
+                    s.gpa.free(removed.consumer);
+                    removed_count += 1;
+                } else k += 1;
+            }
+            return ctx.int(removed_count);
+        }
+        if (eq(sub, "SETID")) {
+            const entry = s.get(args[2]) orelse return ctx.err("NOGROUP No such key");
+            if (entry.kind != .stream) return ctx.err("WRONGTYPE");
+            const g = findGroup(entry, args[3]) orelse return ctx.err("NOGROUP No such group");
+            const start = if (eq(args[4], "$"))
+                IdPair{ .ms = entry.last_ms, .seq = entry.last_seq }
+            else
+                (parseStreamId(args[4]) orelse IdPair{ .ms = 0, .seq = 0 });
+            g.last_ms = start.ms;
+            g.last_seq = start.seq;
+            return ctx.simple("OK");
+        }
+        if (eq(sub, "CREATECONSUMER")) {
+            const entry = s.get(args[2]) orelse return ctx.err("NOGROUP No such key");
+            if (entry.kind != .stream) return ctx.err("WRONGTYPE");
+            const g = findGroup(entry, args[3]) orelse return ctx.err("NOGROUP No such group");
+            if (findConsumer(g, args[4]) != null) return ctx.int(0);
+            try g.consumers.append(s.gpa, .{ .name = try s.gpa.dupe(u8, args[4]), .seen_ms = s.nowMs() });
+            return ctx.int(1);
+        }
+        return ctx.err("ERR unknown XGROUP subcommand");
+    }
+    if (eq(cmd, "XINFO")) {
+        if (args.len < 3) return ctx.err("ERR syntax error");
+        const sub = args[1];
+        if (eq(sub, "STREAM")) {
+            const entry = s.get(args[2]) orelse return ctx.err("ERR no such key");
+            if (entry.kind != .stream) return ctx.err("WRONGTYPE");
+            var last_id_buf: [48]u8 = undefined;
+            const last_id = std.fmt.bufPrint(&last_id_buf, "{d}-{d}", .{ entry.last_ms, entry.last_seq }) catch "0-0";
+            try ctx.arrayHeader(18);
+            try ctx.bulk("length");
+            try ctx.int(@intCast(entry.entries.items.len));
+            try ctx.bulk("radix-tree-keys");
+            try ctx.int(@intCast(entry.entries.items.len));
+            try ctx.bulk("radix-tree-nodes");
+            try ctx.int(@intCast(entry.entries.items.len + 1));
+            try ctx.bulk("groups");
+            try ctx.int(@intCast(entry.groups.items.len));
+            try ctx.bulk("last-generated-id");
+            try ctx.bulk(last_id);
+            try ctx.bulk("first-entry");
+            if (entry.entries.items.len > 0) try streamEntryOut(ctx, &entry.entries.items[0]) else try ctx.bulk(null);
+            try ctx.bulk("last-entry");
+            if (entry.entries.items.len > 0) try streamEntryOut(ctx, &entry.entries.items[entry.entries.items.len - 1]) else try ctx.bulk(null);
+            try ctx.bulk("entries-added");
+            try ctx.int(entry.entries_added);
+            return;
+        }
+        if (eq(sub, "GROUPS")) {
+            const entry = s.get(args[2]) orelse {
+                try ctx.arrayHeader(0);
+                return;
+            };
+            if (entry.kind != .stream) {
+                try ctx.arrayHeader(0);
+                return;
+            }
+            try ctx.arrayHeader(entry.groups.items.len);
+            for (entry.groups.items) |g| {
+                var buf: [48]u8 = undefined;
+                const last = std.fmt.bufPrint(&buf, "{d}-{d}", .{ g.last_ms, g.last_seq }) catch "0-0";
+                try ctx.arrayHeader(8);
+                try ctx.bulk("name");
+                try ctx.bulk(g.name);
+                try ctx.bulk("consumers");
+                try ctx.int(@intCast(g.consumers.items.len));
+                try ctx.bulk("pending");
+                try ctx.int(@intCast(g.pending.items.len));
+                try ctx.bulk("last-delivered-id");
+                try ctx.bulk(last);
+            }
+            return;
+        }
+        if (eq(sub, "CONSUMERS")) {
+            const entry = s.get(args[2]) orelse {
+                try ctx.arrayHeader(0);
+                return;
+            };
+            if (entry.kind != .stream) {
+                try ctx.arrayHeader(0);
+                return;
+            }
+            const g = findGroup(entry, args[3]) orelse {
+                try ctx.arrayHeader(0);
+                return;
+            };
+            try ctx.arrayHeader(g.consumers.items.len);
+            for (g.consumers.items) |c| {
+                var pending: i64 = 0;
+                for (g.pending.items) |p| {
+                    if (std.mem.eql(u8, p.consumer, c.name)) pending += 1;
+                }
+                try ctx.arrayHeader(6);
+                try ctx.bulk("name");
+                try ctx.bulk(c.name);
+                try ctx.bulk("pending");
+                try ctx.int(pending);
+                try ctx.bulk("idle");
+                try ctx.int(s.nowMs() - c.seen_ms);
+            }
+            return;
+        }
+        return ctx.err("ERR unknown XINFO subcommand");
+    }
     if (eq(cmd, "OBJECT")) return ctx.bulk(null);
     if (eq(cmd, "MEMORY")) return ctx.bulk(null);
     if (eq(cmd, "FLUSHALL")) return ctx.simple("OK");
@@ -1616,4 +2137,178 @@ fn appendBulk(out: *std.ArrayList(u8), gpa: std.mem.Allocator, data: []const u8)
     try out.appendSlice(gpa, try std.fmt.bufPrint(&head, "${d}\r\n", .{data.len}));
     try out.appendSlice(gpa, data);
     try out.appendSlice(gpa, "\r\n");
+}
+
+// ───────────────────────── Stream 辅助 ─────────────────────────
+
+const IdPair = struct { ms: u64, seq: u64 };
+
+fn parseStreamId(text: []const u8) ?IdPair {
+    if (std.mem.eql(u8, text, "-")) return .{ .ms = 0, .seq = 0 };
+    if (std.mem.eql(u8, text, "+")) return .{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) };
+    if (std.mem.indexOfScalar(u8, text, '-')) |dash| {
+        const ms = std.fmt.parseInt(u64, text[0..dash], 10) catch return null;
+        const seq = std.fmt.parseInt(u64, text[dash + 1 ..], 10) catch 0;
+        return .{ .ms = ms, .seq = seq };
+    }
+    const ms = std.fmt.parseInt(u64, text, 10) catch return null;
+    return .{ .ms = ms, .seq = 0 };
+}
+
+fn parseStreamRange(text: []const u8, is_start: bool) IdPair {
+    return parseStreamId(text) orelse (if (is_start)
+        IdPair{ .ms = 0, .seq = 0 }
+    else
+        IdPair{ .ms = std.math.maxInt(u64), .seq = std.math.maxInt(u64) });
+}
+
+fn streamOrder(a_ms: u64, a_seq: u64, b_ms: u64, b_seq: u64) std.math.Order {
+    if (a_ms != b_ms) return std.math.order(a_ms, b_ms);
+    return std.math.order(a_seq, b_seq);
+}
+
+fn streamInRange(ms: u64, seq: u64, start: IdPair, end: IdPair) bool {
+    return streamOrder(ms, seq, start.ms, start.seq) != .lt and
+        streamOrder(ms, seq, end.ms, end.seq) != .gt;
+}
+
+fn findGroup(entry: *Entry, name: []const u8) ?*StreamGroup {
+    for (entry.groups.items) |*g| {
+        if (std.mem.eql(u8, g.name, name)) return g;
+    }
+    return null;
+}
+
+fn findConsumer(g: *StreamGroup, name: []const u8) ?*StreamConsumer {
+    for (g.consumers.items) |*c| {
+        if (std.mem.eql(u8, c.name, name)) return c;
+    }
+    return null;
+}
+
+fn streamEntryOut(ctx: *ConnCtx, e: *const StreamEntry) !void {
+    try ctx.arrayHeader(2);
+    try ctx.bulk(e.id);
+    try ctx.arrayHeader(e.fields.len);
+    for (e.fields) |f| try ctx.bulk(f);
+}
+
+fn xreadOut(ctx: *ConnCtx, s: *Shared, key: []const u8, start_arg: []const u8, count: usize, _: ?void) !void {
+    const entry = s.get(key) orelse return ctx.bulk(null);
+    if (entry.kind != .stream) return ctx.bulk(null);
+
+    const start = if (std.mem.eql(u8, start_arg, "$"))
+        IdPair{ .ms = entry.last_ms, .seq = entry.last_seq }
+    else
+        (parseStreamId(start_arg) orelse return ctx.bulk(null));
+
+    var n: usize = 0;
+    for (entry.entries.items) |e| {
+        const id = parseStreamId(e.id) orelse continue;
+        if (streamOrder(id.ms, id.seq, start.ms, start.seq) != .gt) continue;
+        if (n >= count) break;
+        n += 1;
+    }
+    if (n == 0) return ctx.bulk(null);
+
+    try ctx.arrayHeader(1);
+    try ctx.arrayHeader(2);
+    try ctx.bulk(key);
+    try ctx.arrayHeader(n);
+    var emitted: usize = 0;
+    for (entry.entries.items) |*e| {
+        const id = parseStreamId(e.id) orelse continue;
+        if (streamOrder(id.ms, id.seq, start.ms, start.seq) != .gt) continue;
+        if (emitted >= n) break;
+        try streamEntryOut(ctx, e);
+        emitted += 1;
+    }
+}
+
+fn xreadGroupOut(
+    ctx: *ConnCtx,
+    s: *Shared,
+    key: []const u8,
+    group_name: []const u8,
+    consumer_name: []const u8,
+    start_arg: []const u8,
+    count: usize,
+) !void {
+    const entry = s.get(key) orelse return ctx.err("NOGROUP No such key");
+    if (entry.kind != .stream) return ctx.err("WRONGTYPE");
+    const g = findGroup(entry, group_name) orelse return ctx.err("NOGROUP No such group");
+
+    if (findConsumer(g, consumer_name) == null) {
+        try g.consumers.append(s.gpa, .{
+            .name = try s.gpa.dupe(u8, consumer_name),
+            .seen_ms = s.nowMs(),
+        });
+    }
+
+    if (std.mem.eql(u8, start_arg, ">")) {
+        const start = IdPair{ .ms = g.last_ms, .seq = g.last_seq };
+        var n: usize = 0;
+        for (entry.entries.items) |e| {
+            const id = parseStreamId(e.id) orelse continue;
+            if (streamOrder(id.ms, id.seq, start.ms, start.seq) != .gt) continue;
+            if (n >= count) break;
+            n += 1;
+        }
+        if (n == 0) return ctx.bulk(null);
+
+        try ctx.arrayHeader(1);
+        try ctx.arrayHeader(2);
+        try ctx.bulk(key);
+        try ctx.arrayHeader(n);
+        var emitted: usize = 0;
+        for (entry.entries.items) |*e| {
+            const id = parseStreamId(e.id) orelse continue;
+            if (streamOrder(id.ms, id.seq, start.ms, start.seq) != .gt) continue;
+            if (emitted >= n) break;
+            try g.pending.append(s.gpa, .{
+                .id = try s.gpa.dupe(u8, e.id),
+                .consumer = try s.gpa.dupe(u8, consumer_name),
+                .delivery = 1,
+                .last_ms = s.nowMs(),
+            });
+            g.last_ms = id.ms;
+            g.last_seq = id.seq;
+            try streamEntryOut(ctx, e);
+            emitted += 1;
+        }
+        return;
+    }
+
+    // 0 / 指定 Id：读取自身挂起消息
+    const start = parseStreamId(start_arg) orelse IdPair{ .ms = 0, .seq = 0 };
+    var n: usize = 0;
+    for (g.pending.items) |p| {
+        if (!std.mem.eql(u8, p.consumer, consumer_name)) continue;
+        const id = parseStreamId(p.id) orelse continue;
+        if (streamOrder(id.ms, id.seq, start.ms, start.seq) != .gt) continue;
+        if (n >= count) break;
+        n += 1;
+    }
+    if (n == 0) return ctx.bulk(null);
+
+    try ctx.arrayHeader(1);
+    try ctx.arrayHeader(2);
+    try ctx.bulk(key);
+    try ctx.arrayHeader(n);
+    var emitted: usize = 0;
+    for (g.pending.items) |*p| {
+        if (!std.mem.eql(u8, p.consumer, consumer_name)) continue;
+        const id = parseStreamId(p.id) orelse continue;
+        if (streamOrder(id.ms, id.seq, start.ms, start.seq) != .gt) continue;
+        if (emitted >= n) break;
+        p.delivery += 1;
+        p.last_ms = s.nowMs();
+        for (entry.entries.items) |*e| {
+            if (std.mem.eql(u8, e.id, p.id)) {
+                try streamEntryOut(ctx, e);
+                break;
+            }
+        }
+        emitted += 1;
+    }
 }

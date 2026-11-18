@@ -22,6 +22,7 @@ const hll_mod = @import("hyperloglog.zig");
 const queue_mod = @import("queues/queue.zig");
 const delay_mod = @import("queues/delay.zig");
 const reliable_mod = @import("queues/reliable.zig");
+const stream_mod = @import("queues/stream.zig");
 const deferred_mod = @import("services/deferred.zig");
 
 pub const Redis = redis_mod.Redis;
@@ -388,6 +389,13 @@ pub const FullRedis = struct {
         const k = try self.keyAlloc(name);
         defer self.gpa.free(k);
         return deferred_mod.RedisDeferred.init(&self.redis, k);
+    }
+
+    /// Stream 队列（对应 C# `GetStream` / Rust `get_stream`）。
+    pub fn getStream(self: *FullRedis, topic: []const u8) !stream_mod.RedisStream {
+        const k = try self.keyAlloc(topic);
+        defer self.gpa.free(k);
+        return stream_mod.RedisStream.init(&self.redis, k);
     }
 
     /// 同一实例、指定 db 的新 FullRedis（保留前缀，与 C# `CreateSub` 一致）。

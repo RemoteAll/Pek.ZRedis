@@ -10,6 +10,7 @@ const MockServer = support.MockServer;
 
 test {
     _ = @import("queues_services.zig");
+    _ = @import("stream.zig");
 }
 
 const IoHolder = struct {

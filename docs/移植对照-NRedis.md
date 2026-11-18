@@ -29,8 +29,8 @@
 | 队列 | `RedisQueue.cs` | `queues/queue.rs` | `src/queues/queue.zig` | ✅ `LPUSH`/`RPOP`/`BRPOP`，追踪字段注入，发送失败重试 |
 | 可靠队列 | `RedisReliableQueue.cs` | `queues/reliable.rs` | `src/queues/reliable.zig` | ✅ 确认/回滚/发布消费/死信/错误计数/延迟补投 |
 | 延迟队列 | `RedisDelayQueue.cs` | `queues/delay.rs` | `src/queues/delay.zig` | ✅ `ZADD` 到期分数、`ZRANGEBYSCORE`+`ZREM` 抢占、批量转移 |
-| Stream 消息队列 | `RedisStream.cs` | `queues/stream.rs` | — | ⏳ |
-| 服务层 | `Services/*`（Stat / Deferred / RedLock） | `services.rs` | `src/services/{stat,deferred,redlock}.zig` | ✅ RedLock/延迟批处理/流式统计；EventBus 随 Stream 落地 |
+| Stream 消息队列 | `RedisStream.cs` | `queues/stream.rs` | `src/queues/stream.zig` | ✅ 基元/对象字段展开、消费组、确认/挂起/抢夺、死信、裁剪与区间读 |
+| 服务层 | `Services/*`（Stat / Deferred / RedLock / EventBus） | `services.rs` | `src/services/{stat,deferred,redlock,eventbus}.zig` | ✅ RedLock/延迟批处理/流式统计/事件总线 |
 | Tair 扩展 | `FullRedis.Ex*` | `tair.rs` | `src/full.zig`（`Ex*`） | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
 | 拓扑 | `Clusters/*`（Cluster/Sentinel/Replication） | `cluster/*` | — | ⏳ |
 | TLS | `Ssl` / `rediss://` | rustls | — | ⏳ **当前显式报错，不降级明文** |
@@ -79,12 +79,23 @@
   `EXHPTTL`、`EXHKEYS/EXHVALS/EXHLEN/EXHDEL`（`EXHINCRBY` 按 Rust 取整数返回）。
 - 证据：`tests/queues_services.zig` 6 个用例（普通/延迟/可靠队列、延迟批处理、统计、RedLock、Tair）。
 
+### 五之二、Stream / EventBus（已验证）
+
+- **字段展开**：基元 → `__data`；对象 → 属性扁平化（PascalCase）；数组（JSON）→ 两两成对的字段名/值；
+  每 1000 条带一次 `MAXLEN ~ 1000000` 裁剪。
+- **消息解析**：`toStruct` 先全部按字符串解析（保留 `"0012"` 前导零），失败再回退启发式类型；
+  解析时 **`.allocate = .alloc_always`**（默认会借用输入缓冲，临时缓冲释放后会得到悬空切片）。
+- **消费组**：`retry_ack` 节流 `RetryInterval`（默认 60s）→ `XPENDING` + `XCLAIM` 抢回超时未确认消息，
+  投递次数达 `max_retry` 直接确认丢弃；顺带清理空闲 > 1 小时的消费者；`from_last_offset` 首消费 `SETID $`。
+- **EventBus**：默认 `from_last_offset = true`（首次消费前的消息不补），保留期 3 天 / 维护周期 10 分钟，
+  处理成功才 `XACK`；失败保持挂起等 `retry_ack` 抢回。
+- 证据：`tests/stream.zig` 4 个用例（基础写入/读取/裁剪/删除、消费组、独立消费+抢夺、EventBus）。
+
 ## 六、尚未实现（下一里程碑输入）
 
-1. **Stream**：`__data` 基元约定、对象字段扁平化、消费组、`retry_ack`；随后接 `RedisEventBus`。
-2. **拓扑**：Cluster slot/hash tag/`MOVED`/`ASK`、Sentinel、Replication、`ReadFromReplicas`。
-3. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
-4. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
+1. **拓扑**：Cluster slot/hash tag/`MOVED`/`ASK`、Sentinel、Replication、`ReadFromReplicas`。
+2. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
+3. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
 
 ## 七、Zig 0.17 实测坑（已规避，勿回退）
 
