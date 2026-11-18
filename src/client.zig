@@ -8,8 +8,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const zzig = @import("zzig");
 const resp = @import("resp.zig");
 const options = @import("options.zig");
+const tls_client = zzig.tls_client;
 
 /// 库统一错误集（细节在 `lastError()` 里，满足「失败必须能定位」的日志规范）。
 pub const Error = error{
@@ -29,8 +31,10 @@ pub const Error = error{
     Pool,
     /// 连接已关闭
     Closed,
-    /// 当前构建不支持（例如 TLS 尚未接入）
+    /// 当前构建不支持（例如功能未接入）
     Unsupported,
+    /// TLS 握手 / 证书校验失败（不静默降级）
+    Tls,
     /// 值编码/解码失败
     Type,
     /// 内存不足
@@ -103,6 +107,111 @@ pub const ConnConfig = struct {
     }
 };
 
+const TlsState = struct {
+    client: tls_client.Client,
+    /// `Options.ca.bundle` 要求稳定的锁与证书束地址 → 跟着状态一起住堆上
+    lock: std.Io.RwLock = std.Io.RwLock.init,
+    ca: std.crypto.Certificate.Bundle = .empty,
+    alert: std.crypto.tls.Alert = .{ .level = .warning, .description = .close_notify },
+    stream_reader: std.Io.net.Stream.Reader,
+    stream_writer: std.Io.net.Stream.Writer,
+    /// 四块缓冲一次性分配（socket 读 / socket 写 / 明文读 / 明文写）
+    bufs: []u8,
+
+    const socket_buf_len = tls_client.Client.min_buffer_len;
+    const app_read_len = 8 * 1024;
+    const app_write_len = 8 * 1024;
+
+    fn destroy(self: *TlsState, gpa: std.mem.Allocator) void {
+        // close_notify：告知对端正常结束（失败不影响关闭）
+        self.client.end() catch {};
+        self.ca.deinit(gpa);
+        gpa.free(self.bufs);
+        gpa.destroy(self);
+    }
+};
+
+/// 在已建立的 TCP 上完成 TLS 握手。
+///
+/// - `TlsInsecure=1`：不校验证书/主机名（自签测试环境）；
+/// - 否则加载系统根证书并校验证书链与主机名；根证书为空直接报错，
+///   **绝不静默降级为明文**。
+fn openTls(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cfg: *const ConnConfig,
+    stream: std.Io.net.Stream,
+    diag: *Diag,
+) Error!*TlsState {
+    const total = TlsState.socket_buf_len * 2 + TlsState.app_read_len + TlsState.app_write_len;
+    const bufs = gpa.alloc(u8, total) catch return error.OutOfMemory;
+    errdefer gpa.free(bufs);
+
+    const socket_read = bufs[0..TlsState.socket_buf_len];
+    const socket_write = bufs[TlsState.socket_buf_len..][0..TlsState.socket_buf_len];
+    const tls_read = bufs[TlsState.socket_buf_len * 2 ..][0..TlsState.app_read_len];
+    const tls_write = bufs[TlsState.socket_buf_len * 2 + TlsState.app_read_len ..][0..TlsState.app_write_len];
+
+    const st = gpa.create(TlsState) catch return error.OutOfMemory;
+    errdefer gpa.destroy(st);
+    st.* = .{
+        .client = undefined,
+        .stream_reader = stream.reader(io, socket_read),
+        .stream_writer = stream.writer(io, socket_write),
+        .bufs = bufs,
+    };
+
+    const now = std.Io.Clock.real.now(io);
+
+    var verify_host: []const u8 = "";
+    if (!cfg.tls_insecure) {
+        st.ca.rescan(gpa, io, now) catch |e| {
+            diag.set("加载系统根证书失败（{s}）：{s}", .{ cfg.endpoint, @errorName(e) });
+            return error.Tls;
+        };
+        if (st.ca.bytes.items.len == 0) {
+            diag.set("系统根证书为空（{s}）：拒绝在无法验证服务端的情况下建连；可显式设 TlsInsecure=1", .{cfg.endpoint});
+            return error.Tls;
+        }
+        verify_host = cfg.tls_server_name orelse "";
+        if (verify_host.len == 0) {
+            const hp = parseHostPort(cfg.endpoint) catch {
+                diag.set("TLS 校验需要主机名，但地址无法解析（{s}）；可设 TlsServerName 或 TlsInsecure=1", .{cfg.endpoint});
+                return error.Tls;
+            };
+            verify_host = hp.host;
+        }
+    }
+
+    var entropy: [tls_client.Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+
+    st.client = tls_client.Client.init(&st.stream_reader.interface, &st.stream_writer.interface, .{
+        .host = if (cfg.tls_insecure) .no_verification else .{ .explicit = verify_host },
+        .ca = if (cfg.tls_insecure) .no_verification else .{ .bundle = .{
+            .gpa = gpa,
+            .io = io,
+            .lock = &st.lock,
+            .bundle = &st.ca,
+        } },
+        .read_buffer = tls_read,
+        .write_buffer = tls_write,
+        .entropy = &entropy,
+        .realtime_now = now,
+        .alert = &st.alert,
+        .allow_truncation_attacks = false,
+    }) catch |e| {
+        diag.set("TLS 握手失败（{s}）：{s}；告警 {s}/{s}", .{
+            cfg.endpoint,
+            @errorName(e),
+            @tagName(st.alert.level),
+            @tagName(st.alert.description),
+        });
+        return error.Tls;
+    };
+    return st;
+}
+
 /// 单条 TCP 连接上的 Redis 客户端。
 pub const Client = struct {
     gpa: std.mem.Allocator,
@@ -111,6 +220,8 @@ pub const Client = struct {
     cfg: ConnConfig,
     stream: std.Io.net.Stream,
     reader: resp.Reader,
+    /// 非空表示这条连接走 TLS（堆上状态，避免按值移动后自指向悬空）
+    tls: ?*TlsState = null,
     diag: Diag = .{},
     protocol_version: i32 = 2,
     logged_in: bool = false,
@@ -120,19 +231,6 @@ pub const Client = struct {
 
     /// 建立连接并完成握手（HELLO / AUTH / SELECT）。
     pub fn connect(gpa: std.mem.Allocator, io: std.Io, cfg: *const ConnConfig) Error!Client {
-        if (cfg.tls) {
-            // 明确报错而不是静默降级为明文（TLS 在后续里程碑接入 zzig 的 TLS 客户端）
-            var c = Client{
-                .gpa = gpa,
-                .io = io,
-                .cfg = cfg.*,
-                .stream = undefined,
-                .reader = undefined,
-            };
-            c.diag.set("连接 {s} 失败：当前构建尚未接入 TLS（Tls=true / rediss://），拒绝明文降级", .{cfg.endpoint});
-            return error.Unsupported;
-        }
-
         const hp = parseHostPort(cfg.endpoint) catch |e| {
             var c = Client{ .gpa = gpa, .io = io, .cfg = cfg.*, .stream = undefined, .reader = undefined };
             c.diag.set("解析地址 {s} 失败：{s}", .{ cfg.endpoint, @errorName(e) });
@@ -172,8 +270,20 @@ pub const Client = struct {
             return error.IoError;
         };
         setSocketTimeouts(&self.stream, cfg.timeoutMs());
+
+        if (cfg.tls) {
+            self.tls = openTls(gpa, io, cfg, self.stream, &self.diag) catch |e| {
+                self.reader.deinit();
+                stream.close(io);
+                return e;
+            };
+            self.reader.tls_reader = &self.tls.?.client.reader;
+        }
+
         errdefer {
             self.reader.deinit();
+            if (self.tls) |st| st.destroy(gpa);
+            self.tls = null;
             self.stream.close(io);
             self.write_buf.deinit(gpa);
         }
@@ -193,6 +303,8 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.tls) |st| st.destroy(self.gpa);
+        self.tls = null;
         self.stream.close(self.io);
         self.reader.deinit();
         self.write_buf.deinit(self.gpa);
@@ -434,6 +546,20 @@ pub const Client = struct {
     }
 
     fn writeAll(self: *Client, bytes: []const u8) Error!void {
+        if (self.tls) |st| {
+            st.client.writer.writeAll(bytes) catch |e| {
+                self.broken = true;
+                self.diag.set("TLS 写入失败（{s}，{d} 字节）：{s}", .{ cfgName(self.cfg), bytes.len, @errorName(e) });
+                return error.IoError;
+            };
+            st.client.writer.flush() catch |e| {
+                self.broken = true;
+                self.diag.set("TLS flush 失败（{s}）：{s}", .{ cfgName(self.cfg), @errorName(e) });
+                return error.IoError;
+            };
+            return;
+        }
+
         var sent: usize = 0;
         while (sent < bytes.len) {
             const r = self.io.operate(.{ .net_write = .{

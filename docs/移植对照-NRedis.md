@@ -33,7 +33,7 @@
 | 服务层 | `Services/*`（Stat / Deferred / RedLock / EventBus） | `services.rs` | `src/services/{stat,deferred,redlock,eventbus}.zig` | ✅ RedLock/延迟批处理/流式统计/事件总线 |
 | Tair 扩展 | `FullRedis.Ex*` | `tair.rs` | `src/full.zig`（`Ex*`） | ✅ 字符串/哈希版本、`EXHINCRBY`、逐字段 TTL、`EXH*` 全家族 |
 | 拓扑 | `Clusters/*`（Cluster/Sentinel/Replication） | `cluster/*` | `src/cluster.zig` + `src/topology_discovery.zig` | ✅ 槽位/节点解析/选路/重定向/健康退避/INFO 发现；自动刷新 ⏳ |
-| TLS | `Ssl` / `rediss://` | rustls | — | ⏳ **当前显式报错，不降级明文** |
+| TLS | `Ssl` / `rediss://` | rustls | `src/client.zig`（`zzig.tls_client`） | ✅ 握手/读写接入，`TlsInsecure` 与系统根证书校验；正向待真实服务端 |
 | 异步 API | `*Async`（.NET） | `async_api.rs`（tokio） | — | ➖ Zig 侧不 1:1 迁移（由调用方线程模型决定） |
 | ASP.NET 集成 | `RedisCacheProvider` / `CacheExtensions` | 不迁移 | — | ➖ .NET 宿主专属 |
 
@@ -115,7 +115,8 @@
 
 ## 六、尚未实现（下一里程碑输入）
 
-1. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
+1. **TLS 正向验证**：已接入 `zzig.tls_client`（握手/读写/`TlsInsecure`/系统根证书、失败 `error.Tls` 不降级），
+   但当前无 TLS 测试服务端，`rediss://` 正向往返（含自签/客户端证书）仍需真实环境验证。
 2. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
 
 ## 七、Zig 0.17 实测坑（已规避，勿回退）

@@ -204,6 +204,8 @@ pub const Reader = struct {
     io: std.Io,
     /// 按值持有：`Client` 会被按值返回/移动，存指针会悬空（Windows AFD 句柄会失效）
     stream: std.Io.net.Stream,
+    /// 非空时从 TLS 明文流读取（`zzig.tls_client.Client.reader`），否则直读 socket
+    tls_reader: ?*std.Io.Reader = null,
     buf: []u8,
     start: usize = 0,
     end: usize = 0,
@@ -250,6 +252,15 @@ pub const Reader = struct {
     }
 
     fn readSome(self: *Reader, dst: []u8) Error!usize {
+        if (self.tls_reader) |tls_reader| {
+            var tls_slices = [_][]u8{dst};
+            const n = tls_reader.readVec(&tls_slices) catch |e| switch (e) {
+                error.EndOfStream => return 0,
+                else => return error.Io,
+            };
+            return n;
+        }
+
         var slices = [_][]u8{dst};
         // 不用 `operateTimeout`：Zig 0.17 的 Windows Threaded 后端对带超时的 I/O
         // 会返回 `error.ConcurrencyUnavailable`（与 netConnectIpWindows 的 TODO 同源）。

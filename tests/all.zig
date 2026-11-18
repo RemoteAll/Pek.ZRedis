@@ -13,6 +13,7 @@ test {
     _ = @import("stream.zig");
     _ = @import("cluster.zig");
     _ = @import("topology_auto.zig");
+    _ = @import("tls.zig");
 }
 
 const IoHolder = struct {
