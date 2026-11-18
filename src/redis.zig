@@ -336,6 +336,60 @@ pub const Redis = struct {
         return error.Config;
     }
 
+    pub const KeyGroup = struct {
+        endpoint: []u8,
+        indices: std.ArrayListUnmanaged(usize) = .empty,
+    };
+
+    /// 按当前拓扑把多键命令的 key 分组到各节点（保持原始顺序信息）。
+    ///
+    /// 调用方负责 `freeKeyGroups`。
+    fn groupKeys(self: *Redis, key_list: []const []const u8, write: bool) Error![]KeyGroup {
+        var groups: std.ArrayList(KeyGroup) = .empty;
+        errdefer {
+            for (groups.items) |*g| {
+                self.gpa.free(g.endpoint);
+                g.indices.deinit(self.gpa);
+            }
+            groups.deinit(self.gpa);
+        }
+
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        const topo = if (self.topology) |*t| t else {
+            self.setDiag("多键命令需要拓扑，但拓扑为空", .{});
+            return error.Config;
+        };
+
+        for (key_list, 0..) |key, i| {
+            const route = topo.selectRoute(key, write) orelse {
+                self.setDiag("无法路由 key={s}（槽 {d}）", .{ key, cluster.hashSlot(key) });
+                return error.Config;
+            };
+            var found: ?*KeyGroup = null;
+            for (groups.items) |*g| {
+                if (std.mem.eql(u8, g.endpoint, route.endpoint)) {
+                    found = g;
+                    break;
+                }
+            }
+            if (found == null) {
+                try groups.append(self.gpa, .{ .endpoint = try self.gpa.dupe(u8, route.endpoint) });
+                found = &groups.items[groups.items.len - 1];
+            }
+            try found.?.indices.append(self.gpa, i);
+        }
+        return groups.toOwnedSlice(self.gpa);
+    }
+
+    fn freeKeyGroups(gpa: std.mem.Allocator, groups: []KeyGroup) void {
+        for (groups) |*g| {
+            gpa.free(g.endpoint);
+            g.indices.deinit(gpa);
+        }
+        if (groups.len > 0) gpa.free(groups);
+    }
+
     /// 接管一份外部构建的拓扑（调用方不再释放）。
     pub fn setTopology(self: *Redis, topo: cluster.Topology) void {
         self.topo_mutex.lockUncancelable(self.io);
@@ -603,6 +657,8 @@ pub const Redis = struct {
 
     pub fn removeMany(self: *Redis, key_list: []const []const u8) Error!i64 {
         if (key_list.len == 0) return 0;
+        if (routeEnabled(self)) return self.removeManyGrouped(key_list);
+
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.gpa);
         try args.append(self.gpa, "DEL");
@@ -610,6 +666,24 @@ pub const Redis = struct {
         var v = try self.execute(args.items);
         defer v.deinit(self.gpa);
         return v.asInt() orelse 0;
+    }
+
+    /// 按节点分组 DEL（返回各节点删除数之和）。
+    fn removeManyGrouped(self: *Redis, key_list: []const []const u8) Error!i64 {
+        const groups = try self.groupKeys(key_list, true);
+        defer freeKeyGroups(self.gpa, groups);
+
+        var total: i64 = 0;
+        for (groups) |g| {
+            var args: std.ArrayList([]const u8) = .empty;
+            defer args.deinit(self.gpa);
+            try args.append(self.gpa, "DEL");
+            for (g.indices.items) |idx| try args.append(self.gpa, key_list[idx]);
+            var v = try self.executeKey(key_list[g.indices.items[0]], true, args.items);
+            defer v.deinit(self.gpa);
+            total += v.asInt() orelse 0;
+        }
+        return total;
     }
 
     pub fn setExpire(self: *Redis, key: []const u8, seconds: i64) Error!bool {
@@ -951,6 +1025,7 @@ pub const Redis = struct {
     /// 批量读：返回与 `keys` 等长的值（无值处为 `null`）。
     pub fn getAllRaw(self: *Redis, gpa: std.mem.Allocator, key_list: []const []const u8) Error![]?[]u8 {
         if (key_list.len == 0) return gpa.alloc(?[]u8, 0) catch error.IoError;
+        if (routeEnabled(self)) return self.getAllRawGrouped(gpa, key_list);
 
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.gpa);
@@ -978,11 +1053,53 @@ pub const Redis = struct {
         return out;
     }
 
+    /// 按节点分组 MGET（结果按原 key 顺序汇总）。
+    fn getAllRawGrouped(self: *Redis, gpa: std.mem.Allocator, key_list: []const []const u8) Error![]?[]u8 {
+        const out = gpa.alloc(?[]u8, key_list.len) catch return error.IoError;
+        @memset(out, null);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |slot| if (slot) |s| gpa.free(s);
+            gpa.free(out);
+        }
+        // 先标记全部为已初始化（null），失败时统一按全量释放
+        filled = out.len;
+
+        const groups = try self.groupKeys(key_list, false);
+        defer freeKeyGroups(self.gpa, groups);
+
+        for (groups) |g| {
+            var args: std.ArrayList([]const u8) = .empty;
+            defer args.deinit(self.gpa);
+            try args.append(self.gpa, "MGET");
+            for (g.indices.items) |idx| try args.append(self.gpa, key_list[idx]);
+
+            var v = try self.executeKey(key_list[g.indices.items[0]], false, args.items);
+            defer v.deinit(self.gpa);
+            const items = try self.expectArray(&v);
+            if (items.len != g.indices.items.len) {
+                self.setDiag("MGET 分组返回数量 {d} 与组内键数量 {d} 不一致（{s}）", .{ items.len, g.indices.items.len, g.endpoint });
+                return error.Protocol;
+            }
+            for (items, 0..) |item, i| {
+                if (item.isNull()) continue;
+                out[g.indices.items[i]] = item.asBytesAlloc(gpa) catch return error.IoError;
+            }
+        }
+        return out;
+    }
+
     /// 批量写（`<=2` 项逐个 SET，其余 MSET + EXPIRE 管道，与 C#/Rust 一致）。
     pub fn setAll(self: *Redis, pairs: []const Pair, expire_seconds: i64) Error!void {
         if (pairs.len == 0) return;
         var expire = expire_seconds;
         if (expire < 0) expire = self.opts.expire;
+
+        // 拓扑模式下：逐键 SET（自动选路，且 EXPIRE 与键同节点）
+        if (routeEnabled(self)) {
+            for (pairs) |p| _ = try self.set(p.key, p.value, expire);
+            return;
+        }
 
         if (pairs.len <= 2) {
             for (pairs) |p| _ = try self.set(p.key, p.value, expire);

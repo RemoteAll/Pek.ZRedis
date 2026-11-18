@@ -138,6 +138,22 @@ test "拓扑自动：单键命令按槽位路由到不同服务端" {
     const expect_b: i64 = if (on_first) 0 else 1;
     try testing.expectEqual(expect_a, hlen_a.asInt().?);
     try testing.expectEqual(expect_b, hlen_b.asInt().?);
+
+    // 多键命令：MGET 按节点分组后仍按原 key 顺序汇总
+    const multi = [_][]const u8{ "bar", "foo" };
+    const values = try fr.redis.getAllRaw(a, &multi);
+    defer {
+        for (values) |slot| if (slot) |s| a.free(s);
+        a.free(values);
+    }
+    try testing.expectEqualStrings("v-bar", values[0].?);
+    try testing.expectEqualStrings("v-foo", values[1].?);
+
+    // 多键命令：DEL 跨节点求和
+    try testing.expectEqual(@as(i64, 2), try fr.redis.removeMany(&multi));
+    var gone = try c1.execute(&.{ "GET", "bar" });
+    defer gone.deinit(a);
+    try testing.expect(gone.isNull());
 }
 
 test "拓扑自动：replication 模式按 INFO 发现节点" {
