@@ -75,6 +75,12 @@ pub const ConnConfig = struct {
     tls: bool = false,
     tls_server_name: ?[]u8 = null,
     tls_insecure: bool = false,
+    /// 固定的服务端证书（只信这张；见 `openTls`）
+    certificate_path: ?[]u8 = null,
+    /// PKCS#12 密码（本实现不支持，非空即报错）
+    certificate_password: ?[]u8 = null,
+    /// TLS 协议约束（本实现不支持强制单版本，单版本会报错）
+    tls_protocol: options.TlsProtocol = .none,
 
     pub fn initFromOptions(gpa: std.mem.Allocator, opt: *const options.Options, index: usize) !ConnConfig {
         var cfg = ConnConfig{
@@ -86,11 +92,14 @@ pub const ConnConfig = struct {
             .max_message_size = opt.max_message_size,
             .tls = opt.tls,
             .tls_insecure = opt.tls_insecure,
+            .tls_protocol = opt.tls_protocol,
         };
         errdefer cfg.deinit();
         if (opt.user_name) |s| cfg.user_name = try gpa.dupe(u8, s);
         if (opt.password) |s| cfg.password = try gpa.dupe(u8, s);
         if (opt.tls_server_name) |s| cfg.tls_server_name = try gpa.dupe(u8, s);
+        if (opt.certificate_path) |s| cfg.certificate_path = try gpa.dupe(u8, s);
+        if (opt.certificate_password) |s| cfg.certificate_password = try gpa.dupe(u8, s);
         return cfg;
     }
 
@@ -99,6 +108,8 @@ pub const ConnConfig = struct {
         if (self.user_name) |s| self.gpa.free(s);
         if (self.password) |s| self.gpa.free(s);
         if (self.tls_server_name) |s| self.gpa.free(s);
+        if (self.certificate_path) |s| self.gpa.free(s);
+        if (self.certificate_password) |s| self.gpa.free(s);
         self.* = undefined;
     }
 
@@ -156,41 +167,78 @@ fn openTls(
     const tls_write = bufs[TlsState.socket_buf_len * 2 + TlsState.app_read_len ..][0..TlsState.app_write_len];
 
     const st = gpa.create(TlsState) catch return error.OutOfMemory;
-    errdefer gpa.destroy(st);
     st.* = .{
         .client = undefined,
         .stream_reader = stream.reader(io, socket_read),
         .stream_writer = stream.writer(io, socket_write),
         .bufs = bufs,
     };
+    // `bufs` 由上面的 errdefer 释放；这里补上证书束（加载固定证书 / 扫系统根都会占内存，
+    // 握手失败时若不释放会报 leaked hash_map + array_list）
+    errdefer {
+        st.ca.deinit(gpa);
+        gpa.destroy(st);
+    }
 
     const now = std.Io.Clock.real.now(io);
 
+    // C# `SslProtocol` / `TlsProtocol=Tls12|Tls13`：本实现按 TLS1.3/1.2 顺序协商，
+    // 没有「强制单版本」的开关 → **明确报错**，绝不静默忽略（静默忽略会让运维以为版本已锁定）。
+    switch (cfg.tls_protocol) {
+        .none, .both => {},
+        .tls12, .tls13 => {
+            diag.set("不支持强制单一 TLS 版本（{s}）：TlsProtocol={s}；当前实现固定按 TLS1.3/1.2 协商，" ++
+                "如需锁定版本请在反向代理层做，或去掉该配置", .{ cfg.endpoint, @tagName(cfg.tls_protocol) });
+            return error.Config;
+        },
+    }
+    if (cfg.certificate_password) |_| {
+        diag.set("不支持带密码的 PKCS#12 证书（{s}）：CertificatePassword 仅 C# 可用；" ++
+            "请提供 PEM 证书（Certificate=xxx.pem），或用 TlsInsecure=1", .{cfg.endpoint});
+        return error.Config;
+    }
+
     var verify_host: []const u8 = "";
     if (!cfg.tls_insecure) {
-        st.ca.rescan(gpa, io, now) catch |e| {
-            diag.set("加载系统根证书失败（{s}）：{s}", .{ cfg.endpoint, @errorName(e) });
-            return error.Tls;
-        };
-        if (st.ca.bytes.items.len == 0) {
-            diag.set("系统根证书为空（{s}）：拒绝在无法验证服务端的情况下建连；可显式设 TlsInsecure=1", .{cfg.endpoint});
-            return error.Tls;
-        }
-        verify_host = cfg.tls_server_name orelse "";
-        if (verify_host.len == 0) {
-            const hp = parseHostPort(cfg.endpoint) catch {
-                diag.set("TLS 校验需要主机名，但地址无法解析（{s}）；可设 TlsServerName 或 TlsInsecure=1", .{cfg.endpoint});
+        if (cfg.certificate_path) |path| {
+            // C# `Certificate` 语义是「证书固定」：给了就只认这张。
+            // Zig 侧的等价实现是**只信这张证书**（唯一信任锚）——对自签证书、固定 CA 都成立。
+            st.ca.addCertsFromFilePathAbsolute(gpa, io, now, path) catch |e| {
+                diag.set("加载固定证书失败（{s}）：{s}；路径 {s}", .{ cfg.endpoint, @errorName(e), path });
                 return error.Tls;
             };
-            verify_host = hp.host;
+            if (st.ca.bytes.items.len == 0) {
+                diag.set("固定证书文件不含可用证书（{s}）：{s}", .{ cfg.endpoint, path });
+                return error.Tls;
+            }
+            // C# `OnCertificateValidationCallback` 在有 Certificate 时**只比对证书、不校主机名**
+            // → 这里同样不校主机名（host 保持 no_verification），但仍走信任锚校验。
+        } else {
+            st.ca.rescan(gpa, io, now) catch |e| {
+                diag.set("加载系统根证书失败（{s}）：{s}", .{ cfg.endpoint, @errorName(e) });
+                return error.Tls;
+            };
+            if (st.ca.bytes.items.len == 0) {
+                diag.set("系统根证书为空（{s}）：拒绝在无法验证服务端的情况下建连；可显式设 TlsInsecure=1", .{cfg.endpoint});
+                return error.Tls;
+            }
+            verify_host = cfg.tls_server_name orelse "";
+            if (verify_host.len == 0) {
+                const hp = parseHostPort(cfg.endpoint) catch {
+                    diag.set("TLS 校验需要主机名，但地址无法解析（{s}）；可设 TlsServerName 或 TlsInsecure=1", .{cfg.endpoint});
+                    return error.Tls;
+                };
+                verify_host = hp.host;
+            }
         }
     }
 
     var entropy: [tls_client.Client.Options.entropy_len]u8 = undefined;
     io.random(&entropy);
 
+    const check_host = !cfg.tls_insecure and cfg.certificate_path == null;
     st.client = tls_client.Client.init(&st.stream_reader.interface, &st.stream_writer.interface, .{
-        .host = if (cfg.tls_insecure) .no_verification else .{ .explicit = verify_host },
+        .host = if (check_host) .{ .explicit = verify_host } else .no_verification,
         .ca = if (cfg.tls_insecure) .no_verification else .{ .bundle = .{
             .gpa = gpa,
             .io = io,
@@ -204,15 +252,44 @@ fn openTls(
         .alert = &st.alert,
         .allow_truncation_attacks = false,
     }) catch |e| {
-        diag.set("TLS 握手失败（{s}）：{s}；告警 {s}/{s}", .{
-            cfg.endpoint,
-            @errorName(e),
-            @tagName(st.alert.level),
-            @tagName(st.alert.description),
-        });
+        // 只有真收到告警才报 level/description；否则默认值（warning/close_notify）会误导排查
+        if (st.alert.description == .close_notify) {
+            diag.set("TLS 握手失败（{s}）：{s}", .{ cfg.endpoint, @errorName(e) });
+        } else {
+            diag.set("TLS 握手失败（{s}）：{s}；对端告警 {s}/{s}", .{
+                cfg.endpoint,
+                @errorName(e),
+                @tagName(st.alert.level),
+                @tagName(st.alert.description),
+            });
+        }
         return error.Tls;
     };
     return st;
+}
+
+/// 最近一次 `Client.connect` 的失败原因（线程局部）。
+///
+/// 为什么需要：`connect` 失败时 `Client` 被丢弃，内部 `diag` 也跟着丢，池层只能报
+/// `Tls` / `Connect` 这种没有信息量的错误名；这里保留文本供上层拼接（日志规范：做什么+为什么+上下文）。
+threadlocal var connect_diag_buf: [512]u8 = undefined;
+threadlocal var connect_diag_len: usize = 0;
+
+fn recordConnectDiag(text: []const u8) void {
+    const n = @min(text.len, connect_diag_buf.len);
+    @memcpy(connect_diag_buf[0..n], text[0..n]);
+    connect_diag_len = n;
+}
+
+/// 格式化写入诊断（超长则留空，上层回落成错误名，不引入额外错误分支）。
+fn recordConnectFmt(comptime fmt: []const u8, args: anytype) void {
+    const text = std.fmt.bufPrint(&connect_diag_buf, fmt, args) catch return;
+    connect_diag_len = text.len;
+}
+
+/// 最近一次 `Client.connect` 失败的诊断（空表示上次成功或尚未连接）。
+pub fn lastConnectError() []const u8 {
+    return connect_diag_buf[0..connect_diag_len];
 }
 
 /// 单条 TCP 连接上的 Redis 客户端。
@@ -234,15 +311,14 @@ pub const Client = struct {
 
     /// 建立连接并完成握手（HELLO / AUTH / SELECT）。
     pub fn connect(gpa: std.mem.Allocator, io: std.Io, cfg: *const ConnConfig) Error!Client {
+        connect_diag_len = 0; // 清空上一轮，避免上层拼到陈旧原因
         const hp = parseHostPort(cfg.endpoint) catch |e| {
-            var c = Client{ .gpa = gpa, .io = io, .cfg = cfg.*, .stream = undefined, .reader = undefined };
-            c.diag.set("解析地址 {s} 失败：{s}", .{ cfg.endpoint, @errorName(e) });
+            recordConnectFmt("解析地址 {s} 失败：{s}", .{ cfg.endpoint, @errorName(e) });
             return error.Config;
         };
 
         const addr = std.Io.net.IpAddress.resolve(io, hp.host, hp.port) catch |e| {
-            var c = Client{ .gpa = gpa, .io = io, .cfg = cfg.*, .stream = undefined, .reader = undefined };
-            c.diag.set("DNS 解析 {s}:{d} 失败：{s}", .{ hp.host, hp.port, @errorName(e) });
+            recordConnectFmt("DNS 解析 {s}:{d} 失败：{s}", .{ hp.host, hp.port, @errorName(e) });
             return error.Connect;
         };
         // 注意：Zig 0.17 的 Windows 后端 `netConnectIpWindows` 对非 none 的 timeout 是
@@ -254,8 +330,7 @@ pub const Client = struct {
             .protocol = .tcp,
             .timeout = .none,
         }) catch |e| {
-            var c = Client{ .gpa = gpa, .io = io, .cfg = cfg.*, .stream = undefined, .reader = undefined };
-            c.diag.set("TCP 连接 {s}:{d} 失败（超时 {d}ms）：{s}", .{ hp.host, hp.port, cfg.timeout_ms, @errorName(e) });
+            recordConnectFmt("TCP 连接 {s}:{d} 失败（超时 {d}ms）：{s}", .{ hp.host, hp.port, cfg.timeout_ms, @errorName(e) });
             return error.Connect;
         };
 
@@ -267,6 +342,8 @@ pub const Client = struct {
             .reader = undefined,
             .protocol_version = if (cfg.protocol_version >= 3) 3 else 2,
         };
+        // 构造后的任何失败都把 diag 记到线程局部（成功返回时不触发）
+        errdefer recordConnectDiag(self.diag.text());
         self.reader = resp.Reader.init(gpa, io, self.stream, 16 * 1024, cfg.max_message_size) catch {
             self.diag.set("初始化读缓冲失败（{s}）", .{cfg.endpoint});
             stream.close(io);

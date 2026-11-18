@@ -29,30 +29,30 @@ pub fn main(init: std.process.Init) !void {
         const config = args.next() orelse return usage();
         const prefix = args.next() orelse "";
         const mode = std.meta.stringToEnum(interop.Mode, mode_text) orelse {
-            std.debug.print("RESULT=FAIL\nMESSAGE=未知 interop 模式：{s}（write/verify/clean/report）\n", .{mode_text});
-            return;
+            fail("RESULT=FAIL\nMESSAGE=未知 interop 模式：{s}（write/verify/clean/report）\n", .{mode_text});
         };
         const failures = interop.run(gpa, io, mode, config, prefix) catch |e| {
-            std.debug.print("RESULT=FAIL\nMESSAGE=对拍执行失败：{s}\n", .{@errorName(e)});
-            return;
+            fail("RESULT=FAIL\nMESSAGE=对拍执行失败：{s}\n", .{@errorName(e)});
         };
-        std.debug.print("RESULT={s}\n", .{if (failures == 0) "OK" else "FAIL"});
-        return;
+        if (failures == 0) {
+            std.debug.print("RESULT=OK\n", .{});
+            return;
+        }
+        fail("RESULT=FAIL\n", .{});
     }
 
     const config = args.next() orelse return usage();
     var r = pek_zredis.Redis.fromConfig(gpa, io, config) catch |e| {
-        std.debug.print("RESULT=FAIL\nMESSAGE=连接配置失败：{s}\n", .{@errorName(e)});
-        return;
+        fail("RESULT=FAIL\nMESSAGE=连接配置失败：{s}\n", .{@errorName(e)});
     };
     defer r.deinit();
 
     if (std.mem.eql(u8, cmd, "ping")) {
         const ok = r.ping() catch |e| {
-            std.debug.print("RESULT=FAIL\nMESSAGE=PING 失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
-            return;
+            fail("RESULT=FAIL\nMESSAGE=PING 失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
         };
-        std.debug.print("RESULT={s}\n", .{if (ok) "OK" else "FAIL"});
+        if (!ok) fail("RESULT=FAIL\nMESSAGE=PING 未返回 PONG（{s}）\n", .{r.lastError()});
+        std.debug.print("RESULT=OK\n", .{});
         return;
     }
 
@@ -63,18 +63,17 @@ pub fn main(init: std.process.Init) !void {
         const expire: i64 = if (expire_text) |t| std.fmt.parseInt(i64, t, 10) catch 0 else 0;
 
         const ok = r.set(key, value, expire) catch |e| {
-            std.debug.print("RESULT=FAIL\nMESSAGE=SET 失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
-            return;
+            fail("RESULT=FAIL\nMESSAGE=SET 失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
         };
-        std.debug.print("RESULT={s}\n", .{if (ok) "OK" else "FAIL"});
+        if (!ok) fail("RESULT=FAIL\nMESSAGE=SET 未返回 OK（{s}）\n", .{r.lastError()});
+        std.debug.print("RESULT=OK\n", .{});
         return;
     }
 
     if (std.mem.eql(u8, cmd, "get")) {
         const key = args.next() orelse return usage();
         const value = r.getRaw(gpa, key) catch |e| {
-            std.debug.print("RESULT=FAIL\nMESSAGE=GET 失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
-            return;
+            fail("RESULT=FAIL\nMESSAGE=GET 失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
         };
         if (value) |v| {
             defer gpa.free(v);
@@ -87,8 +86,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "info")) {
         const v = r.version() catch |e| {
-            std.debug.print("RESULT=FAIL\nMESSAGE=读取版本失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
-            return;
+            fail("RESULT=FAIL\nMESSAGE=读取版本失败：{s}（{s}）\n", .{ @errorName(e), r.lastError() });
         };
         defer if (v) |s| gpa.free(s);
         const st = r.serverType() catch pek_zredis.ServerType.redis;
@@ -99,12 +97,10 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "selfcheck")) {
         const key = "zredis:selfcheck";
         _ = r.set(key, "hello", 60) catch |e| {
-            std.debug.print("RESULT=FAIL\nSTEP=set\nMESSAGE={s}（{s}）\n", .{ @errorName(e), r.lastError() });
-            return;
+            fail("RESULT=FAIL\nSTEP=set\nMESSAGE={s}（{s}）\n", .{ @errorName(e), r.lastError() });
         };
         const got = r.getRaw(gpa, key) catch |e| {
-            std.debug.print("RESULT=FAIL\nSTEP=get\nMESSAGE={s}（{s}）\n", .{ @errorName(e), r.lastError() });
-            return;
+            fail("RESULT=FAIL\nSTEP=get\nMESSAGE={s}（{s}）\n", .{ @errorName(e), r.lastError() });
         };
         defer if (got) |v| gpa.free(v);
         _ = r.remove(key) catch {};
@@ -115,10 +111,16 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         std.debug.print("RESULT=FAIL\nMESSAGE=回读内容不一致\n", .{});
-        return;
+        std.process.exit(1);
     }
 
     return usage();
+}
+
+/// 失败统一走非零退出（CI/脚本可直接判 `$LASTEXITCODE`）。
+fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt, args);
+    std.process.exit(1);
 }
 
 fn usage() void {

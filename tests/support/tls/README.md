@@ -1,6 +1,8 @@
 # TLS 正向往返测试夹具（仅本地测试用）
 
 - `cert.pem` / `key.pem`：自签 RSA2048，SAN `localhost` / `127.0.0.1`，有效期 10 年，**仅供本仓库测试**。
+- `other_cert.pem` / `other_key.pem`：**另一张**自签证书（CN `other-zredis-test`），只用于「证书固定必须拒绝非指定证书」的负向用例；
+  两张证书 SHA-1 指纹不同（`EF:B3:…:8B:55` vs `C9:6B:…:96:65`）。
 - `tls_redis_server.py`：最小 TLS Redis 服务端（PING/SET/GET/DEL/SELECT/AUTH/QUIT），键空间**进程级共享**
   （跨连接可见，便于 CLI 每次单独建连验证 SET → GET）。
   启动：`python tests/support/tls/tls_redis_server.py <port> tests/support/tls/cert.pem tests/support/tls/key.pem`
@@ -17,6 +19,10 @@
 LEN=5
 VALUE=world
 PASS: TLS 正向 PING / SET / GET（127.0.0.1:<port>）
+PASS: TLS 固定证书（Certificate=正确证书）连接成功
+PASS: TLS 固定证书拒绝非指定证书（TlsCertificateNotVerified）
+PASS: TlsProtocol 单版本明确报错（不静默忽略）
+PASS: rediss:// 自动启用 TLS
 ```
 
 手工复现（两个终端）：

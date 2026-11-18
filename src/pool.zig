@@ -97,7 +97,13 @@ pub const Pool = struct {
                     return error.Pool;
                 };
                 holder.* = client.Client.connect(self.gpa, self.io, &self.cfg) catch |e| {
-                    self.setDiag("建立连接失败（{s}）：{s}", .{ self.cfg.endpoint, @errorName(e) });
+                    // 具体原因（TLS 握手失败 / 证书校验 / DNS …）在连接层已记录到线程局部
+                    const reason = client.lastConnectError();
+                    if (reason.len != 0) {
+                        self.setDiag("建立连接失败（{s}）：{s}（{s}）", .{ self.cfg.endpoint, reason, @errorName(e) });
+                    } else {
+                        self.setDiag("建立连接失败（{s}）：{s}", .{ self.cfg.endpoint, @errorName(e) });
+                    }
                     self.gpa.destroy(holder);
                     self.decTotalAndSignal();
                     return e;

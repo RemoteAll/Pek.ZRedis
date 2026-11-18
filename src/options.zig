@@ -39,6 +39,46 @@ pub const Mode = enum {
     }
 };
 
+/// TLS 协议版本约束（对齐 C# `SslProtocol` / `TlsProtocol`）。
+///
+/// C# 用 `SslProtocols` 按位或表达（如 `Tls12, Tls13`）；这里只保留本实现能表达的三档：
+/// 不约束 / 仅 1.2 / 仅 1.3 / 两者都允许。**旧协议（Ssl2/Ssl3/Tls/Tls11）明确报错**，
+/// 不静默降级——C# 解析失败会退化成 `None`（等于不启用 TLS），那等于把配错变成明文，不能跟。
+pub const TlsProtocol = enum {
+    none,
+    tls12,
+    tls13,
+    both,
+
+    pub fn parse(text: []const u8) !TlsProtocol {
+        const s = std.mem.trim(u8, text, " \t\r\n");
+        if (s.len == 0) return .none;
+        const eql = std.ascii.eqlIgnoreCase;
+        if (eql(s, "none")) return .none;
+
+        var has12 = false;
+        var has13 = false;
+        var it = std.mem.tokenizeAny(u8, s, ",|;+ ");
+        while (it.next()) |part| {
+            if (eql(part, "tls12") or eql(part, "tls1.2")) {
+                has12 = true;
+            } else if (eql(part, "tls13") or eql(part, "tls1.3")) {
+                has13 = true;
+            } else if (eql(part, "ssl2") or eql(part, "ssl3") or eql(part, "tls") or
+                eql(part, "tls10") or eql(part, "tls1.0") or eql(part, "tls11") or eql(part, "tls1.1"))
+            {
+                return error.UnsupportedTlsProtocol;
+            } else {
+                return error.InvalidTlsProtocol;
+            }
+        }
+        if (has12 and has13) return .both;
+        if (has12) return .tls12;
+        if (has13) return .tls13;
+        return error.InvalidTlsProtocol;
+    }
+};
+
 /// 连接池参数（默认值与 C# `RedisPoolConfig` 一致）。
 pub const PoolConfig = struct {
     /// 池回收时保留的最小空闲数
@@ -89,6 +129,13 @@ pub const Options = struct {
     tls: bool = false,
     tls_server_name: ?[]u8 = null,
     tls_insecure: bool = false,
+    /// 固定的服务端证书（对齐 C# `Certificate` / `Cert` / `CertificateFile`）：
+    /// 给了就**只信这张**（作为唯一信任锚），不再加载系统根证书
+    certificate_path: ?[]u8 = null,
+    /// C# `CertificatePassword` / `CertPassword`：PKCS#12 密码（本实现不支持，非空即报错）
+    certificate_password: ?[]u8 = null,
+    /// 协议版本约束（C# `SslProtocol` / `TlsProtocol`）
+    tls_protocol: TlsProtocol = .none,
 
     pub fn init(gpa: std.mem.Allocator) Options {
         return .{ .gpa = gpa };
@@ -101,6 +148,8 @@ pub const Options = struct {
         if (self.prefix) |s| self.gpa.free(s);
         if (self.sentinel_master_name) |s| self.gpa.free(s);
         if (self.tls_server_name) |s| self.gpa.free(s);
+        if (self.certificate_path) |s| self.gpa.free(s);
+        if (self.certificate_password) |s| self.gpa.free(s);
         for (self.servers.items) |s| self.gpa.free(s);
         self.servers.deinit(self.gpa);
         self.* = undefined;
@@ -205,6 +254,22 @@ pub const Options = struct {
             if (v.len > 0) try self.replace(&self.tls_server_name, v);
         }
         if (getBool(dic, &.{ "tlsinsecure", "sslinsecure", "insecureskipverify" })) |v| self.tls_insecure = v;
+        if (getStr(dic, &.{ "sslprotocol", "tlsprotocol" })) |v| {
+            self.tls_protocol = TlsProtocol.parse(v) catch |e| switch (e) {
+                error.UnsupportedTlsProtocol => return error.UnsupportedTlsProtocol,
+                else => return error.InvalidTlsProtocol,
+            };
+            // C#：`SslProtocol != None` 即视为启用 TLS
+            if (self.tls_protocol != .none) self.tls = true;
+        }
+        if (getStr(dic, &.{ "certificate", "cert", "certificatefile" })) |v| {
+            const t = std.mem.trim(u8, v, " \t\r\n");
+            if (t.len > 0) try self.replace(&self.certificate_path, t);
+        }
+        if (getStr(dic, &.{ "certificatepassword", "certpassword" })) |v| {
+            const t = std.mem.trim(u8, v, " \t\r\n");
+            if (t.len > 0) try self.replace(&self.certificate_password, t);
+        }
 
         if (getInt(dic, &.{ "poolmin", "poolmin" })) |v| {
             if (v >= 0) self.pool.min = @intCast(v);
@@ -381,6 +446,45 @@ test "旧版逗号分隔键值对" {
     try testing.expectEqualStrings("127.0.0.1:6379", ep);
     try testing.expectEqualStrings("pass123", opt.password.?);
     try testing.expectEqual(@as(i32, 3), opt.db);
+}
+
+test "TLS 协议约束按 C# SslProtocol 口径解析" {
+    try testing.expectEqual(TlsProtocol.none, try TlsProtocol.parse(""));
+    try testing.expectEqual(TlsProtocol.none, try TlsProtocol.parse(" None "));
+    try testing.expectEqual(TlsProtocol.tls12, try TlsProtocol.parse("Tls12"));
+    try testing.expectEqual(TlsProtocol.tls13, try TlsProtocol.parse("tls13"));
+    try testing.expectEqual(TlsProtocol.both, try TlsProtocol.parse("Tls12, Tls13"));
+    try testing.expectEqual(TlsProtocol.both, try TlsProtocol.parse("Tls13|Tls12"));
+    // 旧协议明确拒绝（不能像 C# 那样解析失败退化成 None = 不启用 TLS）
+    try testing.expectError(error.UnsupportedTlsProtocol, TlsProtocol.parse("Ssl3"));
+    try testing.expectError(error.UnsupportedTlsProtocol, TlsProtocol.parse("Tls11"));
+    try testing.expectError(error.InvalidTlsProtocol, TlsProtocol.parse("Tls99"));
+
+    var opt = try Options.fromConfig(testing.allocator, "server=h:1;TlsProtocol=Tls12");
+    defer opt.deinit();
+    try testing.expect(opt.tls); // C#：SslProtocol != None 即启用 TLS
+    try testing.expectEqual(TlsProtocol.tls12, opt.tls_protocol);
+
+    try testing.expectError(error.UnsupportedTlsProtocol, Options.fromConfig(testing.allocator, "server=h:1;SslProtocol=Ssl3"));
+    try testing.expectError(error.InvalidTlsProtocol, Options.fromConfig(testing.allocator, "server=h:1;SslProtocol=Nope"));
+}
+
+test "Certificate / CertificatePassword 解析（C# 别名口径）" {
+    var opt = try Options.fromConfig(testing.allocator, "server=h:1;Tls=1;Certificate=cert.pem;CertificatePassword=pw");
+    defer opt.deinit();
+    try testing.expectEqualStrings("cert.pem", opt.certificate_path.?);
+    try testing.expectEqualStrings("pw", opt.certificate_password.?);
+
+    // `Cert` / `CertificateFile` 与 `CertPassword` 是 C# 的别名
+    var alias = try Options.fromConfig(testing.allocator, "server=h:1;Tls=1;CertificateFile=/tmp/a.pem;CertPassword=x");
+    defer alias.deinit();
+    try testing.expectEqualStrings("/tmp/a.pem", alias.certificate_path.?);
+    try testing.expectEqualStrings("x", alias.certificate_password.?);
+
+    var plain = try Options.fromConfig(testing.allocator, "server=h:1;Tls=1");
+    defer plain.deinit();
+    try testing.expect(plain.certificate_path == null);
+    try testing.expectEqual(TlsProtocol.none, plain.tls_protocol);
 }
 
 test "Port 键只补到无端口地址" {

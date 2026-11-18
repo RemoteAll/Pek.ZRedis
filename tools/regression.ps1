@@ -17,7 +17,7 @@
 [CmdletBinding()]
 param(
     # 单元测试基线（新增用例后必须同步抬高）
-    [int]$MinUnit = 46,
+    [int]$MinUnit = 48,
     # 集成测试基线（新增用例后必须同步抬高）
     [int]$MinIntegration = 26
 )
@@ -80,6 +80,28 @@ function Assert-TestCount {
         throw "$Label 存在失败用例：$passed/$total"
     }
     Write-Line "PASS: $Label $passed/$total（基线 $Minimum）"
+}
+
+<#
+.SYNOPSIS
+    跑一次 CLI 并返回退出码与合并输出（正/负向用例都要能拿到非零退出码）。
+#>
+function Invoke-CliRaw {
+    param([string]$ExePath, [string[]]$Arguments)
+    $out = Join-Path ([System.IO.Path]::GetTempPath()) ("zredis-cli-" + [System.Guid]::NewGuid().ToString('N') + ".txt")
+    $err = "$out.err"
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $proc = Start-Process -FilePath $ExePath -ArgumentList $Arguments `
+            -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -Wait -NoNewWindow
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    $stdout = if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw -Encoding UTF8 } else { '' }
+    $stderr = if (Test-Path -LiteralPath $err) { Get-Content -LiteralPath $err -Raw -Encoding UTF8 } else { '' }
+    Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Text = ("$stdout`n$stderr").Trim() }
 }
 
 <#
@@ -158,6 +180,33 @@ function Invoke-TlsRoundTrip {
             throw "TLS GET 未取回 world：$($getLines -join ' ')"
         }
         Write-Line "PASS: TLS 正向 PING / SET / GET（127.0.0.1:$port）"
+
+        # ── 证书固定（对齐 C# `Certificate` 语义：给了就只认这张）与协议约束
+        $certAbs = (Resolve-Path -LiteralPath $cert).Path
+        $otherCert = Join-Path $RootPath 'tests\support\tls\other_cert.pem'
+        $pin = Invoke-CliRaw -ExePath $ExePath -Arguments @('ping', "server=127.0.0.1:$port;Tls=1;Certificate=$certAbs;timeout=3000")
+        if ($pin.ExitCode -ne 0) { throw "TLS 固定证书（正确证书）应连接成功，实际 exit $($pin.ExitCode)：$($pin.Text)" }
+        Write-Line "PASS: TLS 固定证书（Certificate=正确证书）连接成功"
+
+        if (Test-Path -LiteralPath $otherCert) {
+            $pinBad = Invoke-CliRaw -ExePath $ExePath -Arguments @('ping', "server=127.0.0.1:$port;Tls=1;Certificate=$otherCert;timeout=3000")
+            if ($pinBad.ExitCode -eq 0 -or $pinBad.Text -notmatch 'TlsCertificateNotVerified') {
+                throw "TLS 固定证书（另一张证书）应失败并报 TlsCertificateNotVerified，实际 exit $($pinBad.ExitCode)：$($pinBad.Text)"
+            }
+            Write-Line "PASS: TLS 固定证书拒绝非指定证书（TlsCertificateNotVerified）"
+        } else {
+            Write-Line "SKIP: 缺少 other_cert.pem，跳过证书固定负向用例"
+        }
+
+        $verNeg = Invoke-CliRaw -ExePath $ExePath -Arguments @('ping', "server=127.0.0.1:$port;Tls=1;TlsInsecure=1;TlsProtocol=Tls13;timeout=3000")
+        if ($verNeg.ExitCode -eq 0 -or $verNeg.Text -notmatch '不支持强制单一 TLS 版本') {
+            throw "TlsProtocol=Tls13 应明确报错（不静默忽略），实际 exit $($verNeg.ExitCode)：$($verNeg.Text)"
+        }
+        Write-Line "PASS: TlsProtocol 单版本明确报错（不静默忽略）"
+
+        $rediss = Invoke-CliRaw -ExePath $ExePath -Arguments @('ping', "server=rediss://127.0.0.1:$port;TlsInsecure=1;timeout=3000")
+        if ($rediss.ExitCode -ne 0) { throw "rediss:// 应自动启用 TLS，实际 exit $($rediss.ExitCode)：$($rediss.Text)" }
+        Write-Line "PASS: rediss:// 自动启用 TLS"
     } finally {
         if ($server -and -not $server.HasExited) {
             Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
