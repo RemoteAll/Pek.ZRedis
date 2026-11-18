@@ -37,6 +37,7 @@ pub const geo = @import("geo.zig");
 pub const hyperloglog = @import("hyperloglog.zig");
 pub const pubsub = @import("pubsub.zig");
 pub const cluster = @import("cluster.zig");
+pub const info = @import("info.zig");
 pub const topology_discovery = @import("topology_discovery.zig");
 
 pub const queues = struct {

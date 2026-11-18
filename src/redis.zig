@@ -13,6 +13,8 @@ const options = @import("options.zig");
 const client = @import("client.zig");
 const pool = @import("pool.zig");
 const cluster = @import("cluster.zig");
+const info_mod = @import("info.zig");
+const discovery = @import("topology_discovery.zig");
 
 pub const Error = client.Error;
 
@@ -26,46 +28,8 @@ pub const ServerType = enum {
     tencent_cloud,
 };
 
-/// `INFO` 解析结果（键值均自有，`deinit` 统一释放）。
-pub const InfoMap = struct {
-    gpa: std.mem.Allocator,
-    map: std.StringHashMapUnmanaged([]u8) = .empty,
-
-    pub fn get(self: *const InfoMap, key: []const u8) ?[]const u8 {
-        return self.map.get(key);
-    }
-
-    pub fn deinit(self: *InfoMap) void {
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            self.gpa.free(e.key_ptr.*);
-            self.gpa.free(e.value_ptr.*);
-        }
-        self.map.deinit(self.gpa);
-    }
-};
-
-/// 解析 `INFO` 文本（`# Section` 行忽略，`key:value` 取首个冒号）。
-pub fn parseInfo(gpa: std.mem.Allocator, text: []const u8) !InfoMap {
-    var out = InfoMap{ .gpa = gpa };
-    errdefer out.deinit();
-
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        const idx = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const key = std.mem.trim(u8, line[0..idx], " \t\r");
-        const value = std.mem.trim(u8, line[idx + 1 ..], " \t\r");
-        if (key.len == 0) continue;
-        const gop = try out.map.getOrPut(gpa, key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try gpa.dupe(u8, key);
-            gop.value_ptr.* = try gpa.dupe(u8, value);
-        }
-    }
-    return out;
-}
+pub const InfoMap = info_mod.InfoMap;
+pub const parseInfo = info_mod.parseInfo;
 
 pub const Redis = struct {
     gpa: std.mem.Allocator,
@@ -74,6 +38,9 @@ pub const Redis = struct {
     conn_pool: pool.Pool,
     /// 拓扑模式下按端点惰性创建的连接池（仅 `executeOnEndpoint` / `executeOnKey` 使用）
     ep_pools: std.StringHashMapUnmanaged(*pool.Pool) = .empty,
+    topo_mutex: std.Io.Mutex = .init,
+    topology: ?cluster.Topology = null,
+    topology_refreshed_ms: i64 = 0,
     commands: std.atomic.Value(u64) = .init(0),
     errors: std.atomic.Value(u64) = .init(0),
     diag: client.Diag = .{},
@@ -104,6 +71,8 @@ pub const Redis = struct {
     }
 
     pub fn deinit(self: *Redis) void {
+        if (self.topology) |*t| t.deinit();
+        self.topology = null;
         var it = self.ep_pools.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -307,6 +276,162 @@ pub const Redis = struct {
 
         self.setDiag("重定向次数超限（>{d}）：key={s}", .{ hops, key });
         return error.Server;
+    }
+
+    /// 接管一份外部构建的拓扑（调用方不再释放）。
+    pub fn setTopology(self: *Redis, topo: cluster.Topology) void {
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        if (self.topology) |*old| old.deinit();
+        self.topology = topo;
+        self.topology_refreshed_ms = nowMs();
+    }
+
+    pub fn clearTopology(self: *Redis) void {
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        if (self.topology) |*old| old.deinit();
+        self.topology = null;
+        self.topology_refreshed_ms = 0;
+    }
+
+    pub fn topologyNodeCount(self: *Redis) usize {
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        if (self.topology) |*t| return t.nodeCount();
+        return 0;
+    }
+
+    pub fn topologyMode(self: *Redis) ?options.Mode {
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        if (self.topology) |*t| return t.mode();
+        return null;
+    }
+
+    /// 拉取并替换当前拓扑：
+    /// - `cluster`：`CLUSTER NODES`；
+    /// - `sentinel`：`INFO Sentinel` 找主库，再按主库 `INFO` 建复制拓扑；
+    /// - `replication`：`INFO` 解析 `master_host` / `slaveN`；
+    /// - `standalone`：单节点静态拓扑；
+    /// - `auto`：先 `INFO` 识别模式再走上面分支。
+    pub fn refreshTopology(self: *Redis) Error!void {
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+
+        if (self.topology) |*old| old.deinit();
+        self.topology = null;
+
+        const seed = self.opts.endpointAlloc(self.gpa, 0) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Config,
+        };
+        defer self.gpa.free(seed);
+
+        var mode = self.opts.mode;
+        if (mode == .auto) {
+            var inf = try self.info();
+            defer inf.deinit();
+            mode = discovery.detectMode(&inf, self.opts.serverCount()) orelse .standalone;
+        }
+
+        switch (mode) {
+            .cluster => {
+                var v = try self.executeOnEndpoint(seed, &.{ "CLUSTER", "NODES" });
+                defer v.deinit(self.gpa);
+                const text = v.asString() orelse {
+                    self.setDiag("CLUSTER NODES 未返回文本（{s}）", .{seed});
+                    return error.Server;
+                };
+                var topo = try cluster.RedisClusterTopology.init(self.gpa, self.io, text, self.opts.read_from_replicas);
+                if (topo.isEmpty()) {
+                    topo.deinit();
+                    self.setDiag("CLUSTER NODES 解析后为空（{s}）", .{seed});
+                    return error.Server;
+                }
+                self.topology = .{ .cluster = topo };
+            },
+            .sentinel => try self.loadSentinelTopology(seed),
+            .replication => try self.loadReplicationTopology(seed, .replication),
+            else => {
+                const nodes = try self.gpa.alloc(cluster.ClusterNode, 1);
+                nodes[0] = try cluster.ClusterNode.new(self.gpa, seed);
+                self.topology = .{
+                    .static = cluster.StaticTopology.init(self.gpa, self.io, .standalone, nodes, self.opts.read_from_replicas),
+                };
+            },
+        }
+
+        self.topology_refreshed_ms = nowMs();
+    }
+
+    fn infoFromEndpoint(self: *Redis, endpoint: []const u8) Error!InfoMap {
+        var v = try self.executeOnEndpoint(endpoint, &.{"INFO"});
+        defer v.deinit(self.gpa);
+        return parseInfo(self.gpa, v.asString() orelse "");
+    }
+
+    fn loadReplicationTopology(self: *Redis, endpoint: []const u8, mode: options.Mode) Error!void {
+        var inf = try self.infoFromEndpoint(endpoint);
+        defer inf.deinit();
+        var disc = try discovery.parseDiscovery(self.gpa, &inf);
+        defer disc.deinit();
+
+        const nodes = discovery.buildReplicationNodes(self.gpa, &disc, endpoint) catch return error.OutOfMemory;
+        self.topology = .{
+            .replication = cluster.RedisReplicationTopology.init(self.gpa, self.io, mode, nodes, self.opts.read_from_replicas),
+        };
+    }
+
+    fn loadSentinelTopology(self: *Redis, seed: []const u8) Error!void {
+        // 先问哨兵主库地址；查不到就按种子节点当主库处理
+        var v = self.executeOnEndpoint(seed, &.{ "INFO", "Sentinel" }) catch null;
+        if (v) |*value| {
+            defer value.deinit(self.gpa);
+            if (value.asString()) |text| {
+                var inf = try parseInfo(self.gpa, text);
+                defer inf.deinit();
+                var disc = try discovery.parseDiscovery(self.gpa, &inf);
+                defer disc.deinit();
+                if (disc.masters.len > 0) {
+                    const master = disc.masters[0];
+                    return self.loadReplicationTopology(master, .sentinel);
+                }
+            }
+        }
+        try self.loadReplicationTopology(seed, .sentinel);
+    }
+
+    fn ensureTopology(self: *Redis) Error!void {
+        self.topo_mutex.lockUncancelable(self.io);
+        const have = self.topology != null;
+        const refresh_seconds = self.opts.topology_refresh_seconds;
+        const stale = have and refresh_seconds > 0 and
+            (nowMs() - self.topology_refreshed_ms) >= @as(i64, @intCast(refresh_seconds)) * 1000;
+        self.topo_mutex.unlock(self.io);
+
+        if (have and !stale) return;
+
+        self.refreshTopology() catch |err| {
+            if (have) {
+                // 刷新失败时保留旧拓扑继续服务（与 C#/Rust 的「尽力而为」一致）
+                self.setDiag("拓扑刷新失败，继续使用旧拓扑（{s}）", .{@errorName(err)});
+                return;
+            }
+            return err;
+        };
+    }
+
+    /// 自动模式执行：确保拓扑新鲜 → 按 key 选节点 → `MOVED`/`ASK`/失败重选。
+    pub fn executeAuto(self: *Redis, key: []const u8, write: bool, args: []const []const u8) Error!resp.Value {
+        try self.ensureTopology();
+
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        if (self.topology) |*topo| return self.executeOnKey(topo, key, write, args);
+
+        self.setDiag("拓扑为空，无法执行 key={s}", .{key});
+        return error.Config;
     }
 
     /// 管道执行（一次性写入、顺序读回）。
@@ -1060,4 +1185,8 @@ test "服务器类型识别" {
     defer inf.deinit();
     try inf.map.put(testing.allocator, try testing.allocator.dupe(u8, "redis_version"), try testing.allocator.dupe(u8, "1.0-Garnet"));
     try testing.expectEqual(ServerType.garnet, detectServerType(&inf));
+}
+
+fn nowMs() i64 {
+    return @intCast(@divTrunc(zzig.compat.nanoTimestamp(), std.time.ns_per_ms));
 }

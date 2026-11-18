@@ -12,6 +12,7 @@ test {
     _ = @import("queues_services.zig");
     _ = @import("stream.zig");
     _ = @import("cluster.zig");
+    _ = @import("topology_auto.zig");
 }
 
 const IoHolder = struct {

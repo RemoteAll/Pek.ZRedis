@@ -24,8 +24,7 @@ pub const MockServer = struct {
             const listener = addr.listen(io, .{ .reuse_address = true }) catch continue;
 
             const shared = try gpa.create(Shared);
-            shared.* = .{ .gpa = gpa, .io = io };
-
+            shared.* = .{ .gpa = gpa, .io = io, .port = port };
             const self = try gpa.create(MockServer);
             self.* = .{
                 .gpa = gpa,
@@ -176,6 +175,7 @@ const Sub = struct {
 const Shared = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    port: u16 = 0,
     mutex: std.Io.Mutex = .init,
     map: std.StringHashMapUnmanaged(*Entry) = .empty,
     subs: std.ArrayList(Sub) = .empty,
@@ -377,8 +377,21 @@ fn handle(ctx: *ConnCtx, args: []const []const u8) !void {
     }
     if (eq(cmd, "QUIT")) return ctx.simple("OK");
     if (eq(cmd, "INFO")) {
-        return ctx.bulk("# Server\r\nredis_version:7.2.4\r\nserver:mock\r\nredis_mode:standalone\r\n");
+        return ctx.bulk("# Server\r\nredis_version:7.2.4\r\nserver:mock\r\nredis_mode:standalone\r\nrole:master\r\nconnected_slaves:0\r\n");
     }
+    if (eq(cmd, "CLUSTER")) {
+        if (args.len >= 2 and eq(args[1], "NODES")) {
+            var buf: [256]u8 = undefined;
+            const line = try std.fmt.bufPrint(
+                &buf,
+                "0123456789abcdef0123456789abcdef01234567 127.0.0.1:{d}@{d} myself,master - 0 0 1 connected 0-16383\n",
+                .{ s.port, @as(u32, s.port) + 10000 },
+            );
+            return ctx.bulk(line);
+        }
+        return ctx.err("ERR unsupported CLUSTER subcommand");
+    }
+    if (eq(cmd, "ASKING")) return ctx.simple("OK");
     if (eq(cmd, "TIME")) {
         const secs = @divTrunc(zzig.compat.nanoTimestamp(), std.time.ns_per_s);
         var sb: [32]u8 = undefined;

@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const options = @import("options.zig");
-const redis_mod = @import("redis.zig");
+const info_mod = @import("info.zig");
 const cluster = @import("cluster.zig");
 
 /// 复制发现结果。
@@ -29,7 +29,7 @@ pub const Discovery = struct {
 };
 
 /// 依据 `INFO` 判断拓扑模式（与 Rust 同规则）。
-pub fn detectMode(info: *const redis_mod.InfoMap, configured_servers: usize) ?options.Mode {
+pub fn detectMode(info: *const info_mod.InfoMap, configured_servers: usize) ?options.Mode {
     if (info.get("redis_mode")) |mode| {
         if (std.ascii.eqlIgnoreCase(mode, "cluster")) return .cluster;
     }
@@ -74,7 +74,7 @@ fn endpointFromFields(gpa: std.mem.Allocator, text: []const u8) !?[]u8 {
 }
 
 /// 解析主从 / 哨兵发现信息。
-pub fn parseDiscovery(gpa: std.mem.Allocator, info: *const redis_mod.InfoMap) !Discovery {
+pub fn parseDiscovery(gpa: std.mem.Allocator, info: *const info_mod.InfoMap) !Discovery {
     var out = Discovery{ .gpa = gpa };
     errdefer out.deinit();
 
@@ -156,8 +156,8 @@ pub fn buildReplicationNodes(
 
 const testing = std.testing;
 
-fn infoOf(gpa: std.mem.Allocator, text: []const u8) !redis_mod.InfoMap {
-    return redis_mod.parseInfo(gpa, text);
+fn infoOf(gpa: std.mem.Allocator, text: []const u8) !info_mod.InfoMap {
+    return info_mod.parseInfo(gpa, text);
 }
 
 test "模式识别：cluster / sentinel / replication / 未知" {
