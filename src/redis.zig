@@ -111,12 +111,25 @@ pub const Redis = struct {
     // ───────────────────────── 执行内核 ─────────────────────────
 
     /// 执行一条命令（非服务端错误按 `Retry` 重试）。
+    ///
+    /// 已启用拓扑（`refreshTopology` / `setTopology`）时，**单键命令**会自动按 key 选节点，
+    /// 自动处理 `MOVED` / `ASK` / 失败重选；多键与无键命令仍走主连接池。
     pub fn execute(self: *Redis, args: []const []const u8) Error!resp.Value {
+        if (routeEnabled(self)) {
+            if (commandRoute(args, false)) |route| {
+                return self.executeKey(route.key, route.write, args);
+            }
+        }
         return self.executeInner(args, null);
     }
 
     /// 执行阻塞命令（BRPOP / BLPOP / BLMOVE…）。
     pub fn executeBlocking(self: *Redis, args: []const []const u8, block_seconds: i64) Error!resp.Value {
+        if (routeEnabled(self)) {
+            if (commandRoute(args, true)) |route| {
+                return self.executeKeyBlocking(route.key, route.write, args, block_seconds);
+            }
+        }
         return self.executeInner(args, block_seconds);
     }
 
@@ -212,8 +225,17 @@ pub const Redis = struct {
 
     /// 在指定端点上执行（集群/主从路由与对拍用）。
     pub fn executeOnEndpoint(self: *Redis, endpoint: []const u8, args: []const []const u8) Error!resp.Value {
+        return self.executeOnEndpointEx(endpoint, args, null);
+    }
+
+    fn executeOnEndpointEx(
+        self: *Redis,
+        endpoint: []const u8,
+        args: []const []const u8,
+        block: ?i64,
+    ) Error!resp.Value {
         const p = try self.poolFor(endpoint);
-        return self.executeInnerPool(p, endpoint, args, null);
+        return self.executeInnerPool(p, endpoint, args, block);
     }
 
     /// 按拓扑选节点执行；自动处理 `MOVED`（记忆覆盖）与 `ASK`（先发 `ASKING`），
@@ -224,6 +246,17 @@ pub const Redis = struct {
         key: []const u8,
         write: bool,
         args: []const []const u8,
+    ) Error!resp.Value {
+        return self.routeExecute(topology, key, write, args, null);
+    }
+
+    fn routeExecute(
+        self: *Redis,
+        topology: *cluster.Topology,
+        key: []const u8,
+        write: bool,
+        args: []const []const u8,
+        block: ?i64,
     ) Error!resp.Value {
         var route = topology.selectRoute(key, write) orelse {
             self.setDiag("拓扑为空，无法路由 key={s}", .{key});
@@ -243,7 +276,7 @@ pub const Redis = struct {
                 ask.deinit(self.gpa);
             }
 
-            if (self.executeOnEndpoint(route.endpoint, args)) |value| {
+            if (self.executeOnEndpointEx(route.endpoint, args, block)) |value| {
                 topology.resetNode(route.endpoint);
                 return value;
             } else |err| {
@@ -276,6 +309,31 @@ pub const Redis = struct {
 
         self.setDiag("重定向次数超限（>{d}）：key={s}", .{ hops, key });
         return error.Server;
+    }
+
+    /// 单键命令按当前拓扑执行（必要时先刷新拓扑）。
+    pub fn executeKey(self: *Redis, key: []const u8, write: bool, args: []const []const u8) Error!resp.Value {
+        return self.executeKeyBlocking(key, write, args, 0);
+    }
+
+    fn executeKeyBlocking(
+        self: *Redis,
+        key: []const u8,
+        write: bool,
+        args: []const []const u8,
+        block_seconds: i64,
+    ) Error!resp.Value {
+        try self.ensureTopology();
+
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        if (self.topology) |*topo| {
+            const block: ?i64 = if (block_seconds > 0) block_seconds else null;
+            return self.routeExecute(topo, key, write, args, block);
+        }
+
+        self.setDiag("拓扑为空，无法按 key 执行（key={s}）", .{key});
+        return error.Config;
     }
 
     /// 接管一份外部构建的拓扑（调用方不再释放）。
@@ -316,12 +374,6 @@ pub const Redis = struct {
     /// - `standalone`：单节点静态拓扑；
     /// - `auto`：先 `INFO` 识别模式再走上面分支。
     pub fn refreshTopology(self: *Redis) Error!void {
-        self.topo_mutex.lockUncancelable(self.io);
-        defer self.topo_mutex.unlock(self.io);
-
-        if (self.topology) |*old| old.deinit();
-        self.topology = null;
-
         const seed = self.opts.endpointAlloc(self.gpa, 0) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Config,
@@ -334,6 +386,10 @@ pub const Redis = struct {
             defer inf.deinit();
             mode = discovery.detectMode(&inf, self.opts.serverCount()) orelse .standalone;
         }
+
+        // 先在锁外构建新拓扑（发现命令不带 key，不会触发路由）；失败时保留旧拓扑
+        var built: ?cluster.Topology = null;
+        errdefer if (built) |*t| t.deinit();
 
         switch (mode) {
             .cluster => {
@@ -349,20 +405,25 @@ pub const Redis = struct {
                     self.setDiag("CLUSTER NODES 解析后为空（{s}）", .{seed});
                     return error.Server;
                 }
-                self.topology = .{ .cluster = topo };
+                built = .{ .cluster = topo };
             },
-            .sentinel => try self.loadSentinelTopology(seed),
-            .replication => try self.loadReplicationTopology(seed, .replication),
+            .sentinel => built = try self.buildSentinelTopology(seed),
+            .replication => built = try self.buildReplicationTopology(seed, .replication),
             else => {
                 const nodes = try self.gpa.alloc(cluster.ClusterNode, 1);
                 nodes[0] = try cluster.ClusterNode.new(self.gpa, seed);
-                self.topology = .{
+                built = .{
                     .static = cluster.StaticTopology.init(self.gpa, self.io, .standalone, nodes, self.opts.read_from_replicas),
                 };
             },
         }
 
+        self.topo_mutex.lockUncancelable(self.io);
+        defer self.topo_mutex.unlock(self.io);
+        if (self.topology) |*old| old.deinit();
+        self.topology = built.?;
         self.topology_refreshed_ms = nowMs();
+        built = null;
     }
 
     fn infoFromEndpoint(self: *Redis, endpoint: []const u8) Error!InfoMap {
@@ -371,19 +432,19 @@ pub const Redis = struct {
         return parseInfo(self.gpa, v.asString() orelse "");
     }
 
-    fn loadReplicationTopology(self: *Redis, endpoint: []const u8, mode: options.Mode) Error!void {
+    fn buildReplicationTopology(self: *Redis, endpoint: []const u8, mode: options.Mode) Error!cluster.Topology {
         var inf = try self.infoFromEndpoint(endpoint);
         defer inf.deinit();
         var disc = try discovery.parseDiscovery(self.gpa, &inf);
         defer disc.deinit();
 
         const nodes = discovery.buildReplicationNodes(self.gpa, &disc, endpoint) catch return error.OutOfMemory;
-        self.topology = .{
+        return .{
             .replication = cluster.RedisReplicationTopology.init(self.gpa, self.io, mode, nodes, self.opts.read_from_replicas),
         };
     }
 
-    fn loadSentinelTopology(self: *Redis, seed: []const u8) Error!void {
+    fn buildSentinelTopology(self: *Redis, seed: []const u8) Error!cluster.Topology {
         // 先问哨兵主库地址；查不到就按种子节点当主库处理
         var v = self.executeOnEndpoint(seed, &.{ "INFO", "Sentinel" }) catch null;
         if (v) |*value| {
@@ -395,11 +456,11 @@ pub const Redis = struct {
                 defer disc.deinit();
                 if (disc.masters.len > 0) {
                     const master = disc.masters[0];
-                    return self.loadReplicationTopology(master, .sentinel);
+                    return self.buildReplicationTopology(master, .sentinel);
                 }
             }
         }
-        try self.loadReplicationTopology(seed, .sentinel);
+        return self.buildReplicationTopology(seed, .sentinel);
     }
 
     fn ensureTopology(self: *Redis) Error!void {
@@ -1189,4 +1250,67 @@ test "服务器类型识别" {
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(zzig.compat.nanoTimestamp(), std.time.ns_per_ms));
+}
+
+// ───────────────────────── 命令级自动选路 ─────────────────────────
+
+const CmdRoute = struct { key: []const u8, write: bool };
+
+fn anyCmd(cmd: []const u8, comptime names: []const []const u8) bool {
+    inline for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(cmd, name)) return true;
+    }
+    return false;
+}
+
+/// 单键命令表（key 固定在第 1 个参数）。
+///
+/// 约定与 C#/Rust 一致：多键命令（MGET/DEL/mset/RENAME/EVAL/SCAN…）与无键命令
+/// （PING/INFO/CLUSTER…）不路由，避免误发到不持有该 key 的节点。
+const WRITE_CMDS = [_][]const u8{
+    "SET",              "SETEX",           "PSETEX",    "SETNX",   "GETSET",     "GETDEL",
+    "GETEX",            "APPEND",          "INCR",      "DECR",    "INCRBY",     "DECRBY",
+    "INCRBYFLOAT",      "SETRANGE",        "SETBIT",    "EXPIRE",  "PEXPIRE",    "EXPIREAT",
+    "PEXPIREAT",        "PERSIST",         "HSET",      "HSETNX",  "HMSET",      "HDEL",
+    "HINCRBY",          "HINCRBYFLOAT",    "LPUSH",     "RPUSH",   "LPUSHX",     "RPUSHX",
+    "LPOP",             "RPOP",            "LSET",      "LREM",    "LTRIM",      "LINSERT",
+    "SADD",             "SREM",            "SPOP",      "ZADD",    "ZREM",       "ZINCRBY",
+    "ZREMRANGEBYSCORE", "ZREMRANGEBYRANK", "ZPOPMIN",   "ZPOPMAX", "XADD",       "XDEL",
+    "XTRIM",            "XACK",            "XCLAIM",    "GEOADD",  "PFADD",      "EXSET",
+    "EXINCRBY",         "EXHSET",          "EXHINCRBY", "EXHDEL",  "EXHPEXPIRE",
+};
+
+const READ_CMDS = [_][]const u8{
+    "GET",       "STRLEN",        "TYPE",      "TTL",        "PTTL",
+    "GETBIT",    "BITCOUNT",      "BITPOS",    "GETRANGE",   "HGET",
+    "HMGET",     "HGETALL",       "HLEN",      "HKEYS",      "HVALS",
+    "HEXISTS",   "HSCAN",         "LLEN",      "LRANGE",     "LINDEX",
+    "SCARD",     "SMEMBERS",      "SISMEMBER", "SMISMEMBER", "SSCAN",
+    "ZCARD",     "ZSCORE",        "ZRANK",     "ZREVRANK",   "ZRANGE",
+    "ZREVRANGE", "ZRANGEBYSCORE", "ZCOUNT",    "ZSCAN",      "XLEN",
+    "XRANGE",    "XPENDING",      "GEODIST",   "GEOPOS",     "GEOHASH",
+    "GEOSEARCH", "EXGET",         "EXHGET",    "EXHMGET",    "EXHGETWITHVER",
+    "EXHPTTL",   "EXHKEYS",       "EXHVALS",   "EXHLEN",
+};
+
+fn commandRoute(args: []const []const u8, blocking: bool) ?CmdRoute {
+    if (args.len < 2) return null;
+    const cmd = args[0];
+    const key = args[1];
+    if (key.len == 0 or std.mem.eql(u8, key, "*")) return null;
+
+    if (blocking) {
+        // 仅单键阻塞命令；BLMOVE/BRPOPLPUSH 是多键，交给主池
+        if (anyCmd(cmd, &.{ "BLPOP", "BRPOP" })) return .{ .key = key, .write = true };
+        return null;
+    }
+    if (anyCmd(cmd, &WRITE_CMDS)) return .{ .key = key, .write = true };
+    if (anyCmd(cmd, &READ_CMDS)) return .{ .key = key, .write = false };
+    return null;
+}
+
+fn routeEnabled(self: *Redis) bool {
+    self.topo_mutex.lockUncancelable(self.io);
+    defer self.topo_mutex.unlock(self.io);
+    return self.topology != null;
 }

@@ -19,7 +19,7 @@ param(
     # 单元测试基线（新增用例后必须同步抬高）
     [int]$MinUnit = 43,
     # 集成测试基线（新增用例后必须同步抬高）
-    [int]$MinIntegration = 24
+    [int]$MinIntegration = 25
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,6 +127,7 @@ try {
 } finally {
     Pop-Location
 }
+
 
 
 

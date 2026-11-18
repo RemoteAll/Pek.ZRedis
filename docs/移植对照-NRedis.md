@@ -104,13 +104,16 @@
   （`master_host:port`、`slaveN`、`masterN` 地址）+ `buildReplicationNodes`；`INFO` 解析已下沉到 `src/info.zig`（解除循环导入）。
 - **自动拓扑**：`Redis.refreshTopology` 按模式拉取（cluster → `CLUSTER NODES`；sentinel → `INFO Sentinel` 找主库再建复制拓扑；
   replication → `INFO`；standalone → 单节点；auto → 先 `INFO` 判型）；`executeAuto` 按 `TopologyRefreshSeconds` 惰性刷新（0 = 不自动刷），
-  刷新失败保留旧拓扑并写诊断。
-- 证据：`src/cluster.zig` 5 个单元用例、`src/topology_discovery.zig` 2 个单元用例、`tests/cluster.zig` 1 + `tests/topology_auto.zig` 2 个集成用例。
+  刷新失败**保留旧拓扑**并写诊断（新拓扑先在锁外构建再原子替换，避免刷新期间锁内递归）。
+- **命令级自动选路**：启用拓扑后 `Redis.execute` / `executeBlocking` 按单键命令表（key 固定第 1 参数）自动选节点，
+  自动处理 `MOVED`/`ASK`/失败重选；因此**各结构体（哈希/列表/集合/有序集合/队列/Stream/Tair）的单键命令自动生效**。
+  多键（`MGET`/`DEL`/`mset`/`RENAME`/`EVAL`）与无键命令（`PING`/`INFO`/`CLUSTER`）仍走主连接池（与 C#/Rust 的多键限制一致）。
+- 证据：`src/cluster.zig` 5 个单元用例、`src/topology_discovery.zig` 2 个单元用例、`tests/cluster.zig` 1 + `tests/topology_auto.zig` 3 个集成用例
+  （含双服务端按槽位真实分流验证）。
 
 ## 六、尚未实现（下一里程碑输入）
 
-1. **`FullRedis` 全命令自动选路**：`executeAuto` 已可用，但哈希/队列/Stream 等结构体方法仍走主连接池；
-   需要把每个命令的 key 交给拓扑层（与 Rust `execute_on_key` 同口径）。
+1. **多键命令的分布式执行**：`MGET`/`DEL`/`mset` 等跨节点聚合尚未按节点分组（目前走主池，与 C#/Rust 多键限制一致）。
 2. **TLS**：接入 `zzig` 的 TLS 客户端（需把 `db/tls_client.zig` 导出为公共模块），并补 `rediss://` 正向用例。
 3. **跨语言对拍工具**：C#/Rust ↔ Zig 同一实例双向读写矩阵（照 `Pek.RRedis/scripts/interop-strict.ps1` 的口径）。
 
